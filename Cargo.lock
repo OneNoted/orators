@@ -785,6 +785,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "orators-core",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

@@ -1,33 +1,16 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
 use anyhow::Result;
-use orators_core::{BluetoothMode, DiagnosticCheck, DiagnosticsReport, OratorsConfig, Severity};
+use orators_core::{DiagnosticCheck, DiagnosticsReport, Severity};
 
 use crate::{
-    audio::{BluetoothAudioSettings, WpctlAudioRuntime},
-    bluez::{AdapterInfo, BluetoothCtlBluez, RemoteDeviceInfo},
-    wireplumber::{WirePlumberRoles, WirePlumberRuntime},
+    audio::{BluetoothCard, PipeWireDefaults, WpctlAudioRuntime},
+    bluez::{AdapterInfo, BluetoothCtlBluez},
+    systemd::{SystemdUserRuntime, UserServiceStatus},
 };
-
-const TMAP_UUID: &str = "00001855-0000-1000-8000-00805f9b34fb";
-const LOCAL_LE_AUDIO_MARKER_ROOTS: &[&str] = &["/usr/share/wireplumber", "/usr/share/pipewire"];
-
-#[derive(Debug, Clone)]
-struct LeAudioSupport {
-    local_capable: bool,
-    remote_capable: bool,
-    remote_device_label: Option<String>,
-}
 
 pub async fn collect_report(
     bluez: &BluetoothCtlBluez,
     audio: &WpctlAudioRuntime,
-    wireplumber: &WirePlumberRuntime,
-    fragment_path: &Path,
-    config: &OratorsConfig,
+    systemd: &SystemdUserRuntime,
 ) -> Result<DiagnosticsReport> {
     let mut checks = Vec::new();
 
@@ -65,131 +48,31 @@ pub async fn collect_report(
         }
     };
 
-    checks.push(mode_check(config.bluetooth_mode));
+    checks.push(media_role_check(adapter_info.as_ref()));
+    checks.push(call_roles_check(adapter_info.as_ref()));
 
-    checks.push(
-        match wireplumber.inspect_fragment(fragment_path, config).await {
-            Ok(report) if report.changed => DiagnosticCheck {
-                code: "wireplumber.fragment".to_string(),
-                severity: Severity::Warn,
-                summary: "WirePlumber fragment does not match the configured bluetooth mode"
-                    .to_string(),
-                detail: Some(format!(
-                    "Fragment path: {}. Expected mode: {}. Expected roles: {}.",
-                    report.path,
-                    config.bluetooth_mode.label(),
-                    expected_roles_label(config.bluetooth_mode)
-                )),
-                remediation: Some(
-                    "Run `oratorsctl doctor --apply` and restart WirePlumber if needed."
-                        .to_string(),
-                ),
-            },
-            Ok(report) => DiagnosticCheck {
-                code: "wireplumber.fragment".to_string(),
-                severity: Severity::Info,
-                summary: "WirePlumber fragment matches the configured bluetooth mode".to_string(),
-                detail: Some(format!(
-                    "Fragment path: {}. Expected mode: {}. Expected roles: {}.",
-                    report.path,
-                    config.bluetooth_mode.label(),
-                    expected_roles_label(config.bluetooth_mode)
-                )),
-                remediation: None,
-            },
-            Err(error) => DiagnosticCheck {
-                code: "wireplumber.fragment".to_string(),
-                severity: Severity::Warn,
-                summary: "WirePlumber fragment is missing".to_string(),
-                detail: Some(error.to_string()),
-                remediation: Some(
-                    "Run `oratorsctl doctor --apply` to install the fragment.".to_string(),
-                ),
-            },
-        },
-    );
+    let wireplumber = systemd.service_status("wireplumber.service").await.ok();
+    checks.push(wireplumber_check(wireplumber.as_ref()));
 
-    let roles = wireplumber.roles(fragment_path).await.ok();
-    checks.push(policy_check(
-        config.bluetooth_mode,
-        roles.as_ref(),
-        fragment_path,
+    let defaults = audio.pipewire_defaults().await.ok();
+    checks.push(pipewire_defaults_check(defaults.as_ref()));
+
+    let bluetooth_cards = audio.bluetooth_cards().await.ok();
+    let active_device = bluez
+        .list_devices(true)
+        .await
+        .ok()
+        .and_then(|devices| devices.into_iter().find(|device| device.connected));
+    checks.push(active_profile_check(
+        active_device.as_ref().map(|device| device.address.as_str()),
+        bluetooth_cards.as_deref(),
     ));
 
-    let bluetooth_settings = audio.bluetooth_settings().await.ok();
-    checks.push(autoswitch_check(
-        config.bluetooth_mode,
-        bluetooth_settings,
-        roles.as_ref(),
-    ));
-
-    checks.push(le_audio_local_check(
-        config.bluetooth_mode,
+    checks.push(host_support_check(
         adapter_info.as_ref(),
-        roles.as_ref(),
+        defaults.as_ref(),
+        wireplumber.as_ref(),
     ));
-
-    let remote_devices = bluez.remote_devices().await.ok();
-    checks.push(le_audio_remote_check(
-        config.bluetooth_mode,
-        remote_devices.as_deref(),
-    ));
-
-    let le_audio_support = assess_le_audio_support(
-        adapter_info.as_ref(),
-        roles.as_ref(),
-        remote_devices.as_deref(),
-    );
-    checks.push(call_experience_check(
-        config.bluetooth_mode,
-        &le_audio_support,
-    ));
-
-    let defaults = audio
-        .current_defaults(
-            roles.as_ref().is_some_and(|roles| roles.a2dp_sink_enabled),
-            roles
-                .as_ref()
-                .is_some_and(|roles| roles.classic_call_enabled),
-            roles.as_ref().is_some_and(|roles| roles.le_audio_enabled),
-        )
-        .await;
-    checks.push(match defaults {
-        Ok(audio_defaults) if audio_defaults.output_device.is_some() => DiagnosticCheck {
-            code: "pipewire.defaults".to_string(),
-            severity: Severity::Info,
-            summary: "PipeWire default devices were discovered".to_string(),
-            detail: Some(format!(
-                "Output: {}. Input: {}.",
-                audio_defaults.output_device.as_deref().unwrap_or("not detected"),
-                audio_defaults.input_device.as_deref().unwrap_or("not detected")
-            )),
-            remediation: None,
-        },
-        Ok(audio_defaults) => DiagnosticCheck {
-            code: "pipewire.defaults".to_string(),
-            severity: Severity::Warn,
-            summary: "PipeWire defaults were not fully detected".to_string(),
-            detail: Some(format!(
-                "Output: {}. Input: {}. Media playback can still work, but diagnostics will be less precise.",
-                audio_defaults.output_device.as_deref().unwrap_or("not detected"),
-                audio_defaults.input_device.as_deref().unwrap_or("not detected")
-            )),
-            remediation: Some(
-                "Make sure PipeWire is running in the user session and that a default sink and source are selected."
-                    .to_string(),
-            ),
-        },
-        Err(error) => DiagnosticCheck {
-            code: "pipewire.defaults".to_string(),
-            severity: Severity::Warn,
-            summary: "PipeWire defaults could not be inspected".to_string(),
-            detail: Some(error.to_string()),
-            remediation: Some(
-                "Make sure PipeWire and wpctl are installed and running.".to_string(),
-            ),
-        },
-    });
 
     Ok(DiagnosticsReport {
         generated_at_epoch_secs: crate::now_epoch_secs(),
@@ -197,467 +80,285 @@ pub async fn collect_report(
     })
 }
 
-fn mode_check(mode: BluetoothMode) -> DiagnosticCheck {
-    let (summary, detail) = match mode {
-        BluetoothMode::ClassicMedia => (
-            "Bluetooth mode is classic_media",
-            "Speaker-first mode. Orators exposes A2DP playback only and disables headset autoswitch so media stays in the high-quality speaker path.",
-        ),
-        BluetoothMode::ClassicCallCompat => (
-            "Bluetooth mode is classic_call_compat",
-            "Classic Bluetooth compatibility-call mode. Orators still prefers A2DP first, but it also exposes headset-side HSP/HFP roles and allows headset autoswitch for bidirectional call audio with a quality tradeoff.",
-        ),
-        BluetoothMode::LeAudioCall => (
-            "Bluetooth mode is le_audio_call",
-            "LE Audio call mode. Orators requests BAP roles for newer Bluetooth stacks and keeps A2DP fallback enabled for media, but premium call behavior depends on both the Linux host and the remote device advertising LE Audio capability.",
-        ),
-    };
-
+fn media_role_check(adapter: Option<&AdapterInfo>) -> DiagnosticCheck {
+    let supported = adapter.is_some_and(adapter_supports_media);
     DiagnosticCheck {
-        code: "bluetooth.mode".to_string(),
+        code: "bluez.media_roles".to_string(),
+        severity: if supported {
+            Severity::Info
+        } else {
+            Severity::Error
+        },
+        summary: if supported {
+            "The stock Bluetooth stack advertises Audio Sink / A2DP media support".to_string()
+        } else {
+            "The stock Bluetooth stack does not advertise Audio Sink / A2DP media support"
+                .to_string()
+        },
+        detail: adapter.map(|adapter| format!("Advertised adapter UUIDs: {}.", adapter.uuids.join(", "))),
+        remediation: (!supported).then_some(
+            "Fix the host Bluetooth audio stack outside Orators before pairing or connecting media devices."
+                .to_string(),
+        ),
+    }
+}
+
+fn call_roles_check(adapter: Option<&AdapterInfo>) -> DiagnosticCheck {
+    let exposed = adapter.is_some_and(adapter_exposes_call_roles);
+    DiagnosticCheck {
+        code: "bluez.call_roles".to_string(),
         severity: Severity::Info,
-        summary: summary.to_string(),
-        detail: Some(detail.to_string()),
+        summary: if exposed {
+            "The stock Bluetooth stack also advertises classic call roles".to_string()
+        } else {
+            "The stock Bluetooth stack is effectively media-only".to_string()
+        },
+        detail: Some(
+            "Orators does not manage or optimize call profiles. It only pins connected audio devices back to A2DP for speaker playback."
+                .to_string(),
+        ),
         remediation: None,
     }
 }
 
-fn policy_check(
-    mode: BluetoothMode,
-    roles: Option<&WirePlumberRoles>,
-    fragment_path: &Path,
-) -> DiagnosticCheck {
-    match roles {
-        Some(roles)
-            if roles.a2dp_sink_enabled
-                && roles.classic_call_enabled == mode.classic_call_compat_enabled()
-                && roles.le_audio_enabled == mode.le_audio_call_enabled() =>
-        {
+fn wireplumber_check(status: Option<&UserServiceStatus>) -> DiagnosticCheck {
+    match status {
+        Some(status) if status.active_state == "active" && status.sub_state == "running" => {
+            let detail = if status.restart_count > 0 {
+                format!(
+                    "wireplumber.service is active and running. Restart count since boot: {}.",
+                    status.restart_count
+                )
+            } else {
+                "wireplumber.service is active and running.".to_string()
+            };
             DiagnosticCheck {
-                code: "bluetooth.policy".to_string(),
+                code: "wireplumber.service".to_string(),
                 severity: Severity::Info,
-                summary: "WirePlumber Bluetooth roles match the configured mode".to_string(),
+                summary: "WirePlumber is healthy".to_string(),
+                detail: Some(detail),
+                remediation: None,
+            }
+        }
+        Some(status) => DiagnosticCheck {
+            code: "wireplumber.service".to_string(),
+            severity: Severity::Error,
+            summary: "WirePlumber is not healthy".to_string(),
+            detail: Some(format!(
+                "ActiveState={}, SubState={}, Result={}, RestartCount={}.",
+                status.active_state,
+                status.sub_state,
+                status.result.as_deref().unwrap_or("unknown"),
+                status.restart_count
+            )),
+            remediation: Some(
+                "Stabilize the user-session audio stack before using Orators. Orators will not rewrite WirePlumber config to recover it."
+                    .to_string(),
+            ),
+        },
+        None => DiagnosticCheck {
+            code: "wireplumber.service".to_string(),
+            severity: Severity::Warn,
+            summary: "WirePlumber health could not be inspected".to_string(),
+            detail: Some(
+                "systemctl --user show wireplumber.service did not return a parseable status."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "Make sure WirePlumber is installed and running in the current user session."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn pipewire_defaults_check(defaults: Option<&PipeWireDefaults>) -> DiagnosticCheck {
+    match defaults {
+        Some(defaults) if defaults.output_device.is_some() && !defaults.output_is_dummy => {
+            DiagnosticCheck {
+                code: "pipewire.defaults".to_string(),
+                severity: Severity::Info,
+                summary: "PipeWire default devices were discovered".to_string(),
                 detail: Some(format!(
-                    "Mode: {}. Observed roles: {}.",
-                    mode.label(),
-                    observed_roles_label(roles)
+                    "Output: {}. Input: {}.",
+                    defaults.output_device.as_deref().unwrap_or("not detected"),
+                    defaults.input_device.as_deref().unwrap_or("not detected")
                 )),
                 remediation: None,
             }
         }
-        Some(roles) => DiagnosticCheck {
-            code: "bluetooth.policy".to_string(),
-            severity: Severity::Warn,
-            summary: "WirePlumber Bluetooth roles do not match the configured mode"
-                .to_string(),
+        Some(defaults) => DiagnosticCheck {
+            code: "pipewire.defaults".to_string(),
+            severity: Severity::Error,
+            summary: "PipeWire does not currently have a usable default sink".to_string(),
             detail: Some(format!(
-                "Mode: {}. Expected roles: {}. Observed roles: {}.",
-                mode.label(),
-                expected_roles_label(mode),
-                observed_roles_label(roles)
-            )),
-            remediation: Some(format!(
-                "Run `oratorsctl doctor --apply` to rewrite {}.",
-                fragment_path.display()
-            )),
-        },
-        None => DiagnosticCheck {
-            code: "bluetooth.policy".to_string(),
-            severity: Severity::Warn,
-            summary: "Bluetooth audio policy could not be inspected".to_string(),
-            detail: Some(format!(
-                "Failed to parse WirePlumber roles from {}.",
-                fragment_path.display()
+                "Output: {}. Input: {}.",
+                defaults.output_device.as_deref().unwrap_or("not detected"),
+                defaults.input_device.as_deref().unwrap_or("not detected")
             )),
             remediation: Some(
-                "Run `oratorsctl doctor --apply` to rewrite the fragment, then rerun `oratorsctl doctor`."
-                    .to_string(),
-            ),
-        },
-    }
-}
-
-fn autoswitch_check(
-    mode: BluetoothMode,
-    settings: Option<BluetoothAudioSettings>,
-    roles: Option<&WirePlumberRoles>,
-) -> DiagnosticCheck {
-    let expected = mode.headset_autoswitch_enabled();
-
-    let observed = settings
-        .and_then(|settings| settings.autoswitch_to_headset_profile)
-        .or_else(|| roles.and_then(|roles| roles.autoswitch_to_headset_profile));
-
-    match observed {
-        Some(value) if value == expected => DiagnosticCheck {
-            code: "bluetooth.autoswitch".to_string(),
-            severity: Severity::Info,
-            summary: "Bluetooth headset autoswitch matches the configured mode".to_string(),
-            detail: Some(format!(
-                "Mode: {}. bluetooth.autoswitch-to-headset-profile={value}.",
-                mode.label(),
-            )),
-            remediation: None,
-        },
-        Some(value) => DiagnosticCheck {
-            code: "bluetooth.autoswitch".to_string(),
-            severity: Severity::Warn,
-            summary: "Bluetooth headset autoswitch does not match the configured mode"
-                .to_string(),
-            detail: Some(format!(
-                "Mode: {} expects bluetooth.autoswitch-to-headset-profile={expected}, but the live setting is {value}.",
-                mode.label(),
-            )),
-            remediation: Some(
-                "Run `oratorsctl doctor --apply` and restart WirePlumber or the user session."
+                "Fix the host audio session so a real default sink exists before using Orators."
                     .to_string(),
             ),
         },
         None => DiagnosticCheck {
-            code: "bluetooth.autoswitch".to_string(),
+            code: "pipewire.defaults".to_string(),
             severity: Severity::Warn,
-            summary: "Bluetooth headset autoswitch could not be inspected".to_string(),
-            detail: Some(
-                "Neither `wpctl settings bluetooth.autoswitch-to-headset-profile` nor the fragment content provided a clear value."
-                    .to_string(),
-            ),
+            summary: "PipeWire defaults could not be inspected".to_string(),
+            detail: Some("wpctl could not provide the current default sink/source.".to_string()),
             remediation: Some(
-                "Make sure WirePlumber and wpctl are installed, then rerun `oratorsctl doctor`."
+                "Make sure PipeWire and wpctl are installed and available in the user session."
                     .to_string(),
             ),
         },
     }
 }
 
-fn le_audio_local_check(
-    mode: BluetoothMode,
-    adapter_info: Option<&AdapterInfo>,
-    roles: Option<&WirePlumberRoles>,
+fn active_profile_check(
+    active_device_address: Option<&str>,
+    cards: Option<&[BluetoothCard]>,
 ) -> DiagnosticCheck {
-    let bap_marker_paths = detect_local_bap_role_markers();
-    let fragment_requests_bap = roles.is_some_and(|roles| roles.le_audio_enabled);
-    let adapter_hints = adapter_info
-        .is_some_and(|adapter| adapter.uuids.iter().any(|uuid| is_le_audio_hint_uuid(uuid)));
-
-    let detail = format!(
-        "Fragment requests LE Audio roles: {}. Installed BAP role markers: {}. Adapter LE Audio hint UUIDs: {}.",
-        yes_no(fragment_requests_bap),
-        if bap_marker_paths.is_empty() {
-            "none".to_string()
-        } else {
-            paths_label(&bap_marker_paths)
-        },
-        if adapter_hints {
-            "present"
-        } else {
-            "not detected"
-        }
-    );
-
-    if !bap_marker_paths.is_empty() || adapter_hints {
-        DiagnosticCheck {
-            code: "bluetooth.le_audio.local".to_string(),
-            severity: Severity::Info,
-            summary: "Local stack shows some LE Audio/BAP capability hints".to_string(),
-            detail: Some(detail),
-            remediation: None,
-        }
-    } else {
-        DiagnosticCheck {
-            code: "bluetooth.le_audio.local".to_string(),
-            severity: if mode.le_audio_call_enabled() {
-                Severity::Warn
-            } else {
-                Severity::Info
-            },
-            summary: "Local LE Audio/BAP capability could not be confirmed".to_string(),
-            detail: Some(detail),
-            remediation: mode.le_audio_call_enabled().then_some(
-                "Stay on `classic_media` unless the host stack is upgraded to a PipeWire/WirePlumber/BlueZ combination that clearly exposes LE Audio roles."
-                    .to_string(),
-            ),
-        }
-    }
-}
-
-fn le_audio_remote_check(
-    mode: BluetoothMode,
-    remote_devices: Option<&[RemoteDeviceInfo]>,
-) -> DiagnosticCheck {
-    let Some(device) = remote_devices.and_then(select_remote_device_for_diagnostics) else {
+    let Some(address) = active_device_address else {
         return DiagnosticCheck {
-            code: "bluetooth.le_audio.remote".to_string(),
+            code: "bluetooth.a2dp_pin".to_string(),
             severity: Severity::Info,
-            summary: "No paired Bluetooth device is available for LE Audio hint inspection"
-                .to_string(),
+            summary: "No active Bluetooth audio device is connected".to_string(),
             detail: Some(
-                "Pair or reconnect a phone, then rerun `oratorsctl doctor` to inspect remote-device service UUIDs."
+                "Orators will pin the active Bluetooth card to A2DP only while a device is connected."
                     .to_string(),
             ),
             remediation: None,
         };
     };
 
-    let has_hint = device.uuids.iter().any(|uuid| is_le_audio_hint_uuid(uuid));
-    if has_hint {
-        DiagnosticCheck {
-            code: "bluetooth.le_audio.remote".to_string(),
-            severity: Severity::Info,
-            summary: "Remote device advertises LE Audio-related UUID hints".to_string(),
-            detail: Some(format!(
-                "{} [{}] advertises Telephony and Media Audio (TMAP) or another LE Audio-related UUID.",
-                device.alias.as_deref().unwrap_or("unnamed"),
-                device.address
-            )),
-            remediation: None,
-        }
-    } else {
-        DiagnosticCheck {
-            code: "bluetooth.le_audio.remote".to_string(),
-            severity: if mode.le_audio_call_enabled() {
-                Severity::Warn
-            } else {
-                Severity::Info
-            },
-            summary: "Remote device does not advertise obvious LE Audio service hints"
-                .to_string(),
-            detail: Some(format!(
-                "{} [{}] does not advertise TMAP in BlueZ-visible UUIDs, so LE Audio remains unconfirmed.",
-                device.alias.as_deref().unwrap_or("unnamed"),
-                device.address
-            )),
-            remediation: mode.le_audio_call_enabled().then_some(
-                "Re-pair with a phone that advertises LE Audio services, or fall back to `classic_media`."
-                    .to_string(),
-            ),
-        }
-    }
-}
-
-fn call_experience_check(mode: BluetoothMode, support: &LeAudioSupport) -> DiagnosticCheck {
-    match mode {
-        BluetoothMode::ClassicMedia => DiagnosticCheck {
-            code: "bluetooth.call_experience".to_string(),
-            severity: Severity::Info,
-            summary: "Bluetooth calls are intentionally disabled in speaker-first mode".to_string(),
-            detail: Some(
-                "This mode keeps the device on the high-quality A2DP speaker path. Discord and other call apps should stay on the phone unless you explicitly opt into another mode."
-                    .to_string(),
-            ),
-            remediation: None,
-        },
-        BluetoothMode::ClassicCallCompat => DiagnosticCheck {
-            code: "bluetooth.call_experience".to_string(),
+    let Some(card) = cards.and_then(|cards| {
+        cards.iter().find(|card| {
+            card.address
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(address))
+        })
+    }) else {
+        return DiagnosticCheck {
+            code: "bluetooth.a2dp_pin".to_string(),
             severity: Severity::Warn,
-            summary: "Classic Bluetooth calls are compatibility-only".to_string(),
-            detail: Some(
-                "This mode exposes HSP/HFP so calls can work on older devices, but quality will drop when the microphone is active."
+            summary:
+                "A Bluetooth device is connected, but PipeWire has no matching Bluetooth audio card yet"
                     .to_string(),
-            ),
+            detail: Some(format!("Connected device address: {address}.")),
             remediation: Some(
-                "Use `bluetooth_mode = \"le_audio_call\"` only on devices that advertise LE Audio support if you want the premium call path."
+                "If playback does not appear within a few seconds, disconnect and reconnect the device."
                     .to_string(),
             ),
-        },
-        BluetoothMode::LeAudioCall if support.local_capable && support.remote_capable => {
-            DiagnosticCheck {
-                code: "bluetooth.call_experience".to_string(),
-                severity: Severity::Info,
-                summary: "Premium LE Audio call path is eligible on the current device pair"
-                    .to_string(),
-                detail: Some(format!(
-                    "The local Linux stack exposes LE Audio hints and {} advertises LE Audio-related services. This is the only mode where Orators treats Bluetooth calls as first-class.",
-                    support
-                        .remote_device_label
-                        .as_deref()
-                        .unwrap_or("the remote device")
-                )),
-                remediation: None,
-            }
-        }
-        BluetoothMode::LeAudioCall => DiagnosticCheck {
-            code: "bluetooth.call_experience".to_string(),
-            severity: Severity::Warn,
-            summary: "Premium LE Audio calls are not yet eligible on the current device pair"
-                .to_string(),
-            detail: Some(format!(
-                "Local LE Audio capable: {}. Remote LE Audio capable: {}. {}",
-                yes_no(support.local_capable),
-                yes_no(support.remote_capable),
-                support
-                    .remote_device_label
-                    .as_deref()
-                    .map(|label| format!("{label} does not currently qualify for the premium call path."))
-                    .unwrap_or_else(|| "No paired phone currently qualifies for the premium call path.".to_string())
-            )),
-            remediation: Some(
-                "Keep using `classic_media` for speaker use, or switch to `classic_call_compat` only if you explicitly want the lower-quality compatibility call path."
-                    .to_string(),
-            ),
-        },
-    }
-}
-
-fn assess_le_audio_support(
-    adapter_info: Option<&AdapterInfo>,
-    roles: Option<&WirePlumberRoles>,
-    remote_devices: Option<&[RemoteDeviceInfo]>,
-) -> LeAudioSupport {
-    let local_marker_paths = detect_local_bap_role_markers();
-    let local_capable = roles.is_some_and(|roles| roles.le_audio_enabled)
-        && (!local_marker_paths.is_empty()
-            || adapter_info.is_some_and(|adapter| {
-                adapter.uuids.iter().any(|uuid| is_le_audio_hint_uuid(uuid))
-            }));
-    let remote = remote_devices.and_then(select_remote_device_for_diagnostics);
-    let remote_capable =
-        remote.is_some_and(|device| device.uuids.iter().any(|uuid| is_le_audio_hint_uuid(uuid)));
-
-    LeAudioSupport {
-        local_capable,
-        remote_capable,
-        remote_device_label: remote.map(|device| {
-            format!(
-                "{} [{}]",
-                device.alias.as_deref().unwrap_or("unnamed"),
-                device.address
-            )
-        }),
-    }
-}
-
-fn detect_local_bap_role_markers() -> Vec<PathBuf> {
-    let mut matches = Vec::new();
-    for root in LOCAL_LE_AUDIO_MARKER_ROOTS {
-        collect_bap_role_markers(Path::new(root), &mut matches, 4);
-        if matches.len() >= 4 {
-            break;
-        }
-    }
-    matches
-}
-
-fn collect_bap_role_markers(path: &Path, matches: &mut Vec<PathBuf>, limit: usize) {
-    if matches.len() >= limit {
-        return;
-    }
-
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
-    };
-
-    if metadata.is_dir() {
-        let Ok(entries) = fs::read_dir(path) else {
-            return;
         };
-
-        for entry in entries.flatten() {
-            collect_bap_role_markers(&entry.path(), matches, limit);
-            if matches.len() >= limit {
-                return;
-            }
-        }
-        return;
-    }
-
-    let Ok(contents) = fs::read_to_string(path) else {
-        return;
     };
-    if contents.contains("bap_sink") || contents.contains("bap_source") {
-        matches.push(path.to_path_buf());
+
+    match card.active_profile_name.as_deref() {
+        Some("a2dp-sink") => DiagnosticCheck {
+            code: "bluetooth.a2dp_pin".to_string(),
+            severity: Severity::Info,
+            summary: "The active Bluetooth audio card is pinned to A2DP".to_string(),
+            detail: Some(format!(
+                "Connected device {address} maps to PipeWire card {}.",
+                card.name
+            )),
+            remediation: None,
+        },
+        Some(profile) => DiagnosticCheck {
+            code: "bluetooth.a2dp_pin".to_string(),
+            severity: Severity::Warn,
+            summary: "The active Bluetooth audio card drifted away from A2DP".to_string(),
+            detail: Some(format!(
+                "Connected device {address} is currently on profile `{profile}`."
+            )),
+            remediation: Some(
+                "Orators will try to pin the device back to A2DP at runtime. If drift continues, it will disconnect the active Bluetooth audio device to protect the host audio session."
+                    .to_string(),
+            ),
+        },
+        None => DiagnosticCheck {
+            code: "bluetooth.a2dp_pin".to_string(),
+            severity: Severity::Warn,
+            summary: "The active Bluetooth audio card has no explicit profile selected".to_string(),
+            detail: Some(format!(
+                "Connected device {address} maps to PipeWire card {}.",
+                card.name
+            )),
+            remediation: Some(
+                "Reconnect the device if playback does not settle on A2DP within a few seconds."
+                    .to_string(),
+            ),
+        },
     }
 }
 
-fn select_remote_device_for_diagnostics(devices: &[RemoteDeviceInfo]) -> Option<&RemoteDeviceInfo> {
-    devices
-        .iter()
-        .find(|device| device.connected)
-        .or_else(|| devices.iter().find(|device| device.paired))
-}
+fn host_support_check(
+    adapter: Option<&AdapterInfo>,
+    defaults: Option<&PipeWireDefaults>,
+    wireplumber: Option<&UserServiceStatus>,
+) -> DiagnosticCheck {
+    let ready = adapter.is_some_and(adapter_supports_media)
+        && defaults
+            .is_some_and(|defaults| defaults.output_device.is_some() && !defaults.output_is_dummy)
+        && wireplumber
+            .is_some_and(|status| status.active_state == "active" && status.sub_state == "running");
 
-fn is_le_audio_hint_uuid(uuid: &str) -> bool {
-    uuid.eq_ignore_ascii_case(TMAP_UUID)
-}
-
-fn expected_roles_label(mode: BluetoothMode) -> &'static str {
-    match mode {
-        BluetoothMode::ClassicMedia => "a2dp_sink",
-        BluetoothMode::ClassicCallCompat => "a2dp_sink, hsp_hs, hfp_hf",
-        BluetoothMode::LeAudioCall => "a2dp_sink, bap_sink, bap_source",
+    DiagnosticCheck {
+        code: "host.media_support".to_string(),
+        severity: if ready {
+            Severity::Info
+        } else {
+            Severity::Error
+        },
+        summary: if ready {
+            "This host is ready for config-free Bluetooth speaker playback".to_string()
+        } else {
+            "This host is not ready for config-free Bluetooth speaker playback".to_string()
+        },
+        detail: Some(
+            "Orators relies on the host's stock BlueZ, PipeWire, and WirePlumber setup. It will not write WirePlumber config files or saved runtime settings."
+                .to_string(),
+        ),
+        remediation: (!ready).then_some(
+            "Fix the host audio stack first. Orators will refuse pairing or connection attempts on unsupported or unhealthy hosts."
+                .to_string(),
+        ),
     }
-}
-
-fn observed_roles_label(roles: &WirePlumberRoles) -> String {
-    let mut labels = Vec::new();
-    if roles.a2dp_sink_enabled {
-        labels.push("a2dp_sink");
-    }
-    if roles.classic_call_enabled {
-        labels.push("classic_call_compat");
-    }
-    if roles.le_audio_enabled {
-        labels.push("le_audio_call");
-    }
-
-    if labels.is_empty() {
-        "none".to_string()
-    } else {
-        labels.join(", ")
-    }
-}
-
-fn paths_label(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn adapter_check(info: AdapterInfo) -> DiagnosticCheck {
-    let summary = if info.powered && info.discoverable && info.pairable {
-        "BlueZ adapter is ready for pairing"
-    } else if info.powered {
-        "BlueZ adapter is available but not fully ready for pairing"
-    } else {
-        "BlueZ adapter is present but powered off"
-    };
-
-    let severity = if info.powered && info.discoverable && info.pairable {
-        Severity::Info
-    } else {
-        Severity::Warn
-    };
-
-    let visible_name = info
+    let alias = info
         .alias
-        .clone()
-        .or(info.name.clone())
+        .or(info.name)
         .unwrap_or_else(|| "unknown".to_string());
     let address = info.address.unwrap_or_else(|| "unknown".to_string());
-    let detail = format!(
-        "Look for Bluetooth device '{visible_name}' ({address}). powered={}, discoverable={}, pairable={}, scanning={}, service_uuids={}.",
-        yes_no(info.powered),
-        yes_no(info.discoverable),
-        yes_no(info.pairable),
-        yes_no(info.discovering),
-        info.uuids.len(),
-    );
-
-    let remediation = (!info.discoverable || !info.pairable || !info.powered).then(|| {
-        "Run `oratorsctl pair start --timeout 120` and then refresh Bluetooth devices on the phone."
-            .to_string()
-    });
 
     DiagnosticCheck {
         code: "bluez.adapter".to_string(),
-        severity,
-        summary: summary.to_string(),
-        detail: Some(detail),
-        remediation,
+        severity: Severity::Info,
+        summary: "BlueZ adapter is ready for pairing".to_string(),
+        detail: Some(format!(
+            "Look for Bluetooth device '{alias}' ({address}). powered={}, discoverable={}, pairable={}, scanning={}.",
+            info.powered, info.discoverable, info.pairable, info.discovering
+        )),
+        remediation: None,
     }
 }
 
-fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+fn adapter_supports_media(adapter: &AdapterInfo) -> bool {
+    adapter.uuids.iter().any(|uuid| {
+        uuid.eq_ignore_ascii_case("0000110b-0000-1000-8000-00805f9b34fb")
+            || uuid.eq_ignore_ascii_case("0000110d-0000-1000-8000-00805f9b34fb")
+    })
+}
+
+fn adapter_exposes_call_roles(adapter: &AdapterInfo) -> bool {
+    adapter.uuids.iter().any(|uuid| {
+        matches!(
+            uuid.to_ascii_lowercase().as_str(),
+            "00001108-0000-1000-8000-00805f9b34fb"
+                | "00001112-0000-1000-8000-00805f9b34fb"
+                | "0000111e-0000-1000-8000-00805f9b34fb"
+                | "0000111f-0000-1000-8000-00805f9b34fb"
+        )
+    })
 }

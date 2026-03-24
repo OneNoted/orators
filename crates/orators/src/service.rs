@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use orators_core::{
     AudioDefaults, BluetoothProfile, DeviceInfo, DiagnosticsReport, OratorsConfig, OratorsState,
-    SessionConfigStatus,
 };
 use tokio::sync::Mutex;
 
@@ -18,7 +17,8 @@ pub trait PlatformRuntime: Send + Sync {
     async fn connect_device(&self, address: &str) -> Result<()>;
     async fn disconnect_device(&self, address: &str) -> Result<()>;
     async fn current_audio_defaults(&self) -> Result<AudioDefaults>;
-    async fn apply_session_config(&self) -> Result<SessionConfigStatus>;
+    async fn ensure_host_media_ready(&self) -> Result<()>;
+    async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()>;
     async fn diagnostics(&self) -> Result<DiagnosticsReport>;
     async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf>;
 }
@@ -57,8 +57,12 @@ impl PlatformRuntime for orators_linux::LinuxPlatform {
         self.current_audio_defaults().await
     }
 
-    async fn apply_session_config(&self) -> Result<SessionConfigStatus> {
-        self.apply_session_config().await
+    async fn ensure_host_media_ready(&self) -> Result<()> {
+        self.ensure_host_media_ready().await
+    }
+
+    async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()> {
+        self.guard_active_audio(active_device).await
     }
 
     async fn diagnostics(&self) -> Result<DiagnosticsReport> {
@@ -109,6 +113,7 @@ impl<R: PlatformRuntime> OratorsService<R> {
 
     pub async fn start_pairing(&self, timeout_secs: Option<u64>) -> Result<String> {
         let timeout_secs = timeout_secs.unwrap_or_else(|| self.default_timeout());
+        self.runtime.ensure_host_media_ready().await?;
         self.runtime.start_pairing(timeout_secs).await?;
 
         let now = now_epoch_secs();
@@ -165,6 +170,7 @@ impl<R: PlatformRuntime> OratorsService<R> {
     }
 
     pub async fn connect_device(&self, address: &str) -> Result<String> {
+        self.runtime.ensure_host_media_ready().await?;
         self.refresh_status().await?;
         self.runtime.connect_device(address).await?;
 
@@ -185,11 +191,6 @@ impl<R: PlatformRuntime> OratorsService<R> {
         self.status_json().await
     }
 
-    pub async fn apply_session_config(&self) -> Result<String> {
-        let report = self.runtime.apply_session_config().await?;
-        serialize(&report)
-    }
-
     pub async fn diagnostics_json(&self) -> Result<String> {
         let report = self.runtime.diagnostics().await?;
         serialize(&report)
@@ -198,6 +199,40 @@ impl<R: PlatformRuntime> OratorsService<R> {
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<String> {
         let unit_path = self.runtime.install_user_service(daemon_path).await?;
         Ok(unit_path.display().to_string())
+    }
+
+    pub async fn protect_active_audio_if_needed(&self) -> Result<Option<String>> {
+        let active_device = {
+            self.state
+                .lock()
+                .await
+                .status(now_epoch_secs())
+                .active_device
+        };
+        let Some(active_device) = active_device else {
+            return Ok(None);
+        };
+
+        if let Err(error) = self.runtime.guard_active_audio(Some(&active_device)).await {
+            tracing::warn!(
+                address = %active_device,
+                ?error,
+                "active bluetooth audio became unhealthy; disconnecting device"
+            );
+            if let Err(disconnect_error) = self.runtime.disconnect_device(&active_device).await {
+                tracing::warn!(
+                    address = %active_device,
+                    ?disconnect_error,
+                    "failed to disconnect unhealthy bluetooth audio device"
+                );
+            }
+
+            let mut state = self.state.lock().await;
+            state.disconnect_active();
+            return Ok(Some(serialize(&state.status(now_epoch_secs()))?));
+        }
+
+        Ok(None)
     }
 
     async fn refresh_status(&self) -> Result<orators_core::RuntimeStatus> {
@@ -233,8 +268,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use orators_core::{
-        AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, OratorsConfig,
-        SessionConfigStatus, Severity,
+        AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, OratorsConfig, Severity,
     };
 
     use super::{OratorsService, PlatformRuntime};
@@ -313,19 +347,19 @@ mod tests {
             Ok(AudioDefaults {
                 output_device: Some("Speakers".to_string()),
                 input_device: Some("Microphone".to_string()),
-                a2dp_sink_enabled: true,
-                hfp_hf_enabled: false,
-                le_audio_call_enabled: false,
+                bluetooth_audio_supported: true,
+                call_roles_detected: false,
+                active_bluetooth_profile: None,
+                a2dp_pinned: true,
             })
         }
 
-        async fn apply_session_config(&self) -> Result<SessionConfigStatus> {
-            Ok(SessionConfigStatus {
-                path: "/tmp/test.conf".to_string(),
-                changed: false,
-                restart_required: false,
-                restart_hint: None,
-            })
+        async fn ensure_host_media_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn guard_active_audio(&self, _active_device: Option<&str>) -> Result<()> {
+            Ok(())
         }
 
         async fn diagnostics(&self) -> Result<DiagnosticsReport> {

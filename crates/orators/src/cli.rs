@@ -5,11 +5,11 @@ use clap::{Args, Parser, Subcommand};
 use orators_core::{
     BluetoothProfile, DiagnosticCheck, DiagnosticsReport, RuntimeStatus, Severity, dbus,
 };
-use orators_linux::{systemd::SystemdUserRuntime, wireplumber::WirePlumberRuntime};
+use orators_linux::systemd::SystemdUserRuntime;
 use serde_json::Value;
 use zbus::{Connection, Proxy};
 
-use crate::daemon::{RuntimePaths, default_config_path, ensure_config_exists};
+use crate::daemon::{default_config_path, ensure_config_exists};
 
 #[derive(Debug, Parser)]
 #[command(name = "oratorsctl", about = "Control the Orators daemon")]
@@ -28,7 +28,7 @@ pub enum Command {
     Devices(DeviceArgs),
     Connect { mac: String },
     Disconnect,
-    Doctor(DoctorArgs),
+    Doctor,
     InstallUserService,
 }
 
@@ -60,16 +60,10 @@ pub enum DeviceCommand {
     Forget { mac: String },
 }
 
-#[derive(Debug, Args)]
-pub struct DoctorArgs {
-    #[arg(long)]
-    pub apply: bool,
-}
-
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::InstallUserService => install_user_service(cli.json).await,
-        Command::Doctor(args) => run_doctor(args, cli.json).await,
+        Command::Doctor => run_doctor(cli.json).await,
         command => run_daemon_command(command, cli.json).await,
     }
 }
@@ -137,23 +131,13 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
             let output = client.disconnect_active().await?;
             render_status_output(output, json, "Disconnect request sent.")?;
         }
-        Command::Doctor(_) | Command::InstallUserService => unreachable!(),
+        Command::Doctor | Command::InstallUserService => unreachable!(),
     }
     Ok(())
 }
 
-async fn run_doctor(args: DoctorArgs, json: bool) -> Result<()> {
+async fn run_doctor(json: bool) -> Result<()> {
     let client = ControllerClient::connect().await?;
-    if args.apply {
-        let applied = client.apply_session_config().await?;
-        if json {
-            print_jsonish(&applied)?;
-        } else {
-            let report: orators_core::SessionConfigStatus = serde_json::from_str(&applied)?;
-            render_session_config_report(&report);
-        }
-    }
-
     let diagnostics = client.get_diagnostics().await?;
     if json {
         print_jsonish(&diagnostics)?;
@@ -166,34 +150,16 @@ async fn run_doctor(args: DoctorArgs, json: bool) -> Result<()> {
 
 async fn install_user_service(json: bool) -> Result<()> {
     let config_path = default_config_path()?;
-    let config = ensure_config_exists(&config_path)?;
-    let paths = RuntimePaths::discover(config_path.clone(), &config)?;
+    ensure_config_exists(&config_path)?;
     let daemon_path = resolve_daemon_path()?;
-    let wireplumber = WirePlumberRuntime;
     let systemd = SystemdUserRuntime;
-
-    let config_report = wireplumber
-        .ensure_fragment(&paths.fragment_path, &config)
-        .await?;
     let unit_path = systemd.install_user_service(&daemon_path).await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&config_report)?);
         println!("{}", unit_path.display());
     } else {
-        println!(
-            "WirePlumber config {} at {}.",
-            if config_report.changed {
-                "updated"
-            } else {
-                "already matched"
-            },
-            config_report.path
-        );
-        if let Some(restart_hint) = &config_report.restart_hint {
-            println!("Next step: {restart_hint}");
-        }
         println!("Installed user service at {}.", unit_path.display());
+        println!("Orators no longer writes WirePlumber or PipeWire configuration.");
     }
     Ok(())
 }
@@ -213,22 +179,6 @@ fn print_jsonish(value: &str) -> Result<()> {
         Err(_) => println!("{value}"),
     }
     Ok(())
-}
-
-fn render_session_config_report(report: &orators_core::SessionConfigStatus) {
-    println!(
-        "WirePlumber config {} at {}.",
-        if report.changed {
-            "updated"
-        } else {
-            "already matched"
-        },
-        report.path
-    );
-
-    if let Some(restart_hint) = &report.restart_hint {
-        println!("Next step: {restart_hint}");
-    }
 }
 
 fn render_status_output(output: String, json: bool, prefix: &str) -> Result<()> {
@@ -322,9 +272,6 @@ fn render_devices_summary(devices: &[orators_core::DeviceInfo]) {
 }
 
 fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&DiagnosticsReport>) {
-    if let Some(mode) = diagnostics.and_then(bluetooth_mode_summary) {
-        println!("Bluetooth mode: {mode}");
-    }
     println!(
         "Audio output: {}",
         status
@@ -342,28 +289,25 @@ fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&Diagnostics
             .unwrap_or("not detected")
     );
     println!(
-        "Bluetooth transports: a2dp_sink={}, classic_call_compat={}, le_audio_call={}",
-        yes_no(status.audio.a2dp_sink_enabled),
-        yes_no(status.audio.hfp_hf_enabled),
-        yes_no(status.audio.le_audio_call_enabled),
+        "Bluetooth speaker support: {}",
+        yes_no(status.audio.bluetooth_audio_supported),
     );
-    if let Some(summary) = diagnostics.and_then(audio_mode_detail) {
-        println!("Bluetooth policy: {summary}");
-    } else {
-        println!(
-            "Bluetooth policy: {}",
-            if status.audio.hfp_hf_enabled {
-                "classic bidirectional call support is exposed"
-            } else {
-                "speaker-first A2DP playback only"
-            }
-        );
-    }
-    if let Some(summary) = diagnostics.and_then(autoswitch_summary) {
-        println!("Headset autoswitch: {summary}");
-    }
-    if let Some(summary) = diagnostics.and_then(call_experience_summary) {
-        println!("Call path: {summary}");
+    println!(
+        "Extra call roles on host: {}",
+        yes_no(status.audio.call_roles_detected),
+    );
+    println!(
+        "Active Bluetooth profile: {}",
+        status
+            .audio
+            .active_bluetooth_profile
+            .as_ref()
+            .map(profile_label)
+            .unwrap_or("none"),
+    );
+    println!("A2DP pinned: {}", yes_no(status.audio.a2dp_pinned));
+    if let Some(summary) = diagnostics.and_then(host_support_summary) {
+        println!("Host readiness: {summary}");
     }
 }
 
@@ -404,30 +348,8 @@ fn find_check<'a>(report: &'a DiagnosticsReport, code: &str) -> Option<&'a Diagn
     report.checks.iter().find(|check| check.code == code)
 }
 
-fn bluetooth_mode_summary(report: &DiagnosticsReport) -> Option<&str> {
-    find_check(report, "bluetooth.mode").map(|check| {
-        check
-            .summary
-            .strip_prefix("Bluetooth mode is ")
-            .unwrap_or(check.summary.as_str())
-    })
-}
-
-fn audio_mode_detail(report: &DiagnosticsReport) -> Option<&str> {
-    find_check(report, "bluetooth.mode").and_then(|check| check.detail.as_deref())
-}
-
-fn autoswitch_summary(report: &DiagnosticsReport) -> Option<&str> {
-    let check = find_check(report, "bluetooth.autoswitch")?;
-    if check.summary.contains("matches") {
-        check.detail.as_deref()
-    } else {
-        Some(check.summary.as_str())
-    }
-}
-
-fn call_experience_summary(report: &DiagnosticsReport) -> Option<&str> {
-    let check = find_check(report, "bluetooth.call_experience")?;
+fn host_support_summary(report: &DiagnosticsReport) -> Option<&str> {
+    let check = find_check(report, "host.media_support")?;
     check.detail.as_deref().or(Some(check.summary.as_str()))
 }
 
@@ -535,14 +457,6 @@ impl ControllerClient {
             .map_err(|error| explain_dbus_error("disconnect active device", error))
     }
 
-    async fn apply_session_config(&self) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("ApplySessionConfig", &())
-            .await
-            .map_err(|error| explain_dbus_error("apply session config", error))
-    }
-
     async fn get_diagnostics(&self) -> Result<String> {
         self.proxy()
             .await?
@@ -567,6 +481,10 @@ fn explain_dbus_error(action: &str, error: zbus::Error) -> anyhow::Error {
     let detail = error.to_string();
     let next_step = if detail.contains("pairing window is closed") {
         "Run `oratorsctl pair start --timeout 120` before pairing a new device."
+    } else if detail.contains("does not advertise Audio Sink / A2DP media support") {
+        "Run `oratorsctl doctor` and fix the host Bluetooth audio stack outside Orators."
+    } else if detail.contains("usable default sink") || detail.contains("wireplumber.service") {
+        "Run `oratorsctl doctor` and repair the host audio session before retrying."
     } else if detail.contains("RequestDefaultAgent") {
         "Close other Bluetooth pairing dialogs, then rerun `oratorsctl pair start`."
     } else if detail.contains("no BlueZ adapter found") {
