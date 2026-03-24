@@ -1,0 +1,15 @@
+[package]
+name = "orators-linux"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+orators-core = { path = "../orators-core" }
+tokio.workspace = true
+tracing.workspace = true
+
