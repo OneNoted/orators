@@ -23,7 +23,7 @@ impl Default for OratorsConfig {
             pairing_timeout_secs: 120,
             auto_reconnect: true,
             single_active_device: true,
-            call_audio_enabled: false,
+            call_audio_enabled: true,
             wireplumber_fragment_name: "90-orators-bluetooth.conf".to_string(),
         }
     }
@@ -80,7 +80,7 @@ wireplumber_fragment_name = "90-orators-bluetooth.conf"
         )
         .unwrap();
 
-        assert!(!parsed.call_audio_enabled);
+        assert!(parsed.call_audio_enabled);
         assert_eq!(parsed.pairing_timeout_secs, 45);
     }
 }

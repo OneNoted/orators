@@ -639,6 +639,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_transport_profile_from_hfp_uuid() {
+        let properties = HashMap::from([
+            (
+                "Device".to_string(),
+                OwnedValue::from(
+                    ObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").unwrap(),
+                ),
+            ),
+            (
+                "UUID".to_string(),
+                OwnedValue::from(Str::from("0000111f-0000-1000-8000-00805f9b34fb")),
+            ),
+        ]);
+
+        let (device_path, profile) = parse_transport_profile(&properties).unwrap();
+        assert_eq!(device_path, "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF");
+        assert_eq!(profile, BluetoothProfile::Call);
+    }
+
+    #[test]
     fn adapter_info_captures_pairing_state() {
         let info = AdapterInfo {
             address: Some("04:7F:0E:02:13:3C".to_string()),

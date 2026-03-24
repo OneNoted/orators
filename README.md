@@ -8,7 +8,7 @@
 - Rust workspace with a long-lived daemon and a CLI client
 - D-Bus control API on the user session bus
 - BlueZ pairing and trusted-device control
-- WirePlumber configuration management for `a2dp_sink` and `hfp_ag`
+- WirePlumber configuration management for A2DP media playback and dynamic HFP call audio
 
 ## Workspace
 
@@ -35,5 +35,10 @@ nix flake check
 
 - `oratorsd` runs under `systemd --user`
 - `oratorsctl` talks to the daemon over the session bus
-- the daemon writes a per-user WirePlumber fragment to enable `a2dp_sink` and `hfp_ag`
+- the daemon writes a per-user WirePlumber fragment that prefers `a2dp_sink` for media playback and can expose `hfp_ag` for Discord/VoIP call audio
 
+## Bluetooth Profiles
+
+- Orators prefers A2DP for normal playback.
+- When call audio support is enabled, Orators also exposes HFP so Discord and other VoIP apps can use a Bluetooth microphone path.
+- HFP is inherently lower fidelity than A2DP. Media playback should stay on A2DP until a voice app opens the microphone.

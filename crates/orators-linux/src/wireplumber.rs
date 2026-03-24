@@ -92,6 +92,7 @@ monitor.bluez.rules = [
     ]
     actions = {
       update-props = {
+        device.profile = "a2dp-sink"
         bluez5.auto-connect = [ a2dp_sink ]
       }
     }
@@ -117,10 +118,10 @@ mod tests {
     use super::{parse_roles, render_fragment};
 
     #[test]
-    fn default_fragment_prefers_a2dp_only() {
+    fn default_fragment_enables_dynamic_call_support() {
         let roles = parse_roles(&render_fragment(&OratorsConfig::default()));
         assert!(roles.a2dp_sink_enabled);
-        assert!(!roles.hfp_ag_enabled);
+        assert!(roles.hfp_ag_enabled);
     }
 
     #[test]
@@ -133,6 +134,19 @@ mod tests {
 
         assert!(roles.a2dp_sink_enabled);
         assert!(roles.hfp_ag_enabled);
+        assert!(fragment.contains("device.profile = \"a2dp-sink\""));
         assert!(fragment.contains("bluez5.auto-connect = [ a2dp_sink ]"));
+    }
+
+    #[test]
+    fn media_only_fragment_disables_hfp_explicitly() {
+        let fragment = render_fragment(&OratorsConfig {
+            call_audio_enabled: false,
+            ..OratorsConfig::default()
+        });
+        let roles = parse_roles(&fragment);
+
+        assert!(roles.a2dp_sink_enabled);
+        assert!(!roles.hfp_ag_enabled);
     }
 }

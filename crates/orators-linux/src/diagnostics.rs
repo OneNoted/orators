@@ -83,26 +83,26 @@ pub async fn collect_report(
     checks.push(match roles {
         Some(roles) if roles.hfp_ag_enabled => DiagnosticCheck {
             code: "bluetooth.policy".to_string(),
-            severity: Severity::Warn,
-            summary: "Bluetooth call audio is enabled".to_string(),
-            detail: Some(
-                "The WirePlumber fragment enables `hfp_ag`. This can destabilize speaker-style playback on some Linux stacks."
-                    .to_string(),
-            ),
-            remediation: Some(
-                "Set `call_audio_enabled = false` in `~/.config/orators/config.toml` and run `oratorsctl doctor --apply`."
-                    .to_string(),
-            ),
-        },
-        Some(_) => DiagnosticCheck {
-            code: "bluetooth.policy".to_string(),
             severity: Severity::Info,
-            summary: "Bluetooth audio policy is optimized for media playback".to_string(),
+            summary: "Bluetooth media and call support are enabled".to_string(),
             detail: Some(
-                "The WirePlumber fragment enables `a2dp_sink` without auto-connecting HFP."
+                "Orators will prefer A2DP for normal playback and expose HFP when a voice app opens the microphone. Call sessions will use lower-fidelity HFP audio by design."
                     .to_string(),
             ),
             remediation: None,
+        },
+        Some(_) => DiagnosticCheck {
+            code: "bluetooth.policy".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth call audio is disabled".to_string(),
+            detail: Some(
+                "The current policy exposes speaker-style A2DP playback only. Discord and other VoIP apps will not see a Bluetooth microphone/input path."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "Set `call_audio_enabled = true` in `~/.config/orators/config.toml` and run `oratorsctl doctor --apply`."
+                    .to_string(),
+            ),
         },
         None => DiagnosticCheck {
             code: "bluetooth.policy".to_string(),

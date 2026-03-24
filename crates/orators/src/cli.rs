@@ -332,6 +332,14 @@ fn render_audio_summary(status: &RuntimeStatus) {
         yes_no(status.audio.a2dp_sink_enabled),
         yes_no(status.audio.hfp_ag_enabled),
     );
+    println!(
+        "Call audio: {}",
+        if status.audio.hfp_ag_enabled {
+            "available by default; media stays on A2DP until a voice app uses the microphone"
+        } else {
+            "disabled; Discord and other VoIP apps will not see a Bluetooth microphone path"
+        }
+    );
 }
 
 fn render_doctor(report: &DiagnosticsReport) {
