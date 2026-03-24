@@ -9,8 +9,10 @@ use anyhow::Result;
 use orators_core::{AudioDefaults, DeviceInfo, DiagnosticsReport, OratorsConfig};
 
 use crate::{
-    audio::WpctlAudioRuntime, bluez::BluetoothCtlBluez, diagnostics::collect_report,
-    systemd::SystemdUserRuntime,
+    audio::WpctlAudioRuntime,
+    bluez::BluetoothCtlBluez,
+    diagnostics::collect_report,
+    systemd::{ManagedBackendStatus, SystemdUserRuntime},
 };
 
 pub struct LinuxPlatform {
@@ -132,6 +134,18 @@ impl LinuxPlatform {
 
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {
         self.systemd.install_user_service(daemon_path).await
+    }
+
+    pub async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus> {
+        self.systemd.install_host_backend(daemon_path).await
+    }
+
+    pub async fn uninstall_host_backend(&self) -> Result<()> {
+        self.systemd.uninstall_host_backend().await
+    }
+
+    pub async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
+        self.systemd.managed_backend_status().await
     }
 }
 

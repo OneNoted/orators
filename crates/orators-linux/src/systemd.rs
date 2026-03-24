@@ -5,6 +5,8 @@ use dirs::home_dir;
 use tokio::{fs, process::Command};
 
 const UNIT_NAME: &str = "oratorsd.service";
+const WIREPLUMBER_UNIT_NAME: &str = "wireplumber.service";
+const WIREPLUMBER_AUDIO_OWNER_DROPIN: &str = "90-orators-audio-owner.conf";
 
 pub struct SystemdUserRuntime;
 
@@ -14,6 +16,14 @@ pub struct UserServiceStatus {
     pub sub_state: String,
     pub result: Option<String>,
     pub restart_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedBackendStatus {
+    pub installed: bool,
+    pub wireplumber_audio_profile: bool,
+    pub unit_path: PathBuf,
+    pub wireplumber_dropin_path: PathBuf,
 }
 
 impl SystemdUserRuntime {
@@ -27,6 +37,34 @@ impl SystemdUserRuntime {
         self.run_systemctl(["daemon-reload"]).await?;
 
         Ok(unit_path)
+    }
+
+    pub async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus> {
+        let unit_path = self.install_user_service(daemon_path).await?;
+        let dropin_path = wireplumber_dropin_path()?;
+        if let Some(parent) = dropin_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(&dropin_path, render_wireplumber_audio_owner_override()).await?;
+        self.run_systemctl(["daemon-reload"]).await?;
+
+        let installed = unit_path.exists() && dropin_path.exists();
+        let wireplumber_audio_profile = self.wireplumber_uses_audio_profile().await?;
+        Ok(ManagedBackendStatus {
+            installed,
+            wireplumber_audio_profile,
+            unit_path,
+            wireplumber_dropin_path: dropin_path,
+        })
+    }
+
+    pub async fn uninstall_host_backend(&self) -> Result<()> {
+        let unit_path = unit_path()?;
+        let dropin_path = wireplumber_dropin_path()?;
+        remove_file_if_exists(&unit_path).await?;
+        remove_file_if_exists(&dropin_path).await?;
+        self.run_systemctl(["daemon-reload"]).await?;
+        Ok(())
     }
 
     pub async fn start_orators_service(&self) -> Result<()> {
@@ -61,6 +99,17 @@ impl SystemdUserRuntime {
         })
     }
 
+    pub async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
+        let unit_path = unit_path()?;
+        let dropin_path = wireplumber_dropin_path()?;
+        Ok(ManagedBackendStatus {
+            installed: unit_path.exists() && dropin_path.exists(),
+            wireplumber_audio_profile: self.wireplumber_uses_audio_profile().await?,
+            unit_path,
+            wireplumber_dropin_path: dropin_path,
+        })
+    }
+
     async fn run_systemctl<const N: usize>(&self, args: [&str; N]) -> Result<()> {
         let output = Command::new("systemctl")
             .args(["--user"])
@@ -79,11 +128,43 @@ impl SystemdUserRuntime {
 
         Ok(())
     }
+
+    async fn wireplumber_uses_audio_profile(&self) -> Result<bool> {
+        let output = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                WIREPLUMBER_UNIT_NAME,
+                "--property=ExecStart",
+            ])
+            .output()
+            .await
+            .context("failed to inspect wireplumber ExecStart")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "systemctl --user show {} failed: {}",
+                WIREPLUMBER_UNIT_NAME,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout.contains("wireplumber -p audio"))
+    }
 }
 
 fn unit_path() -> Result<PathBuf> {
     let home = home_dir().context("unable to determine home directory")?;
     Ok(home.join(".config/systemd/user").join(UNIT_NAME))
+}
+
+fn wireplumber_dropin_path() -> Result<PathBuf> {
+    let home = home_dir().context("unable to determine home directory")?;
+    Ok(home
+        .join(".config/systemd/user")
+        .join(format!("{WIREPLUMBER_UNIT_NAME}.d"))
+        .join(WIREPLUMBER_AUDIO_OWNER_DROPIN))
 }
 
 fn parse_service_status(output: &str) -> Result<UserServiceStatus> {
@@ -121,11 +202,23 @@ pub fn render_unit(daemon_path: &Path) -> String {
     )
 }
 
+pub fn render_wireplumber_audio_owner_override() -> &'static str {
+    "[Service]\nExecStart=\nExecStart=/usr/bin/wireplumber -p audio\n"
+}
+
+async fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{parse_service_status, render_unit};
+    use super::{parse_service_status, render_unit, render_wireplumber_audio_owner_override};
 
     #[test]
     fn renders_unit_file_with_binary_path() {
@@ -145,5 +238,11 @@ mod tests {
         assert_eq!(status.sub_state, "running");
         assert_eq!(status.result.as_deref(), Some("success"));
         assert_eq!(status.restart_count, 2);
+    }
+
+    #[test]
+    fn renders_wireplumber_audio_override() {
+        let override_contents = render_wireplumber_audio_owner_override();
+        assert!(override_contents.contains("ExecStart=/usr/bin/wireplumber -p audio"));
     }
 }

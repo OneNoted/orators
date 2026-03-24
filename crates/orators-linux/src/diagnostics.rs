@@ -4,7 +4,7 @@ use orators_core::{DiagnosticCheck, DiagnosticsReport, Severity};
 use crate::{
     audio::{BluetoothCard, BluetoothRuntimeSettings, PipeWireDefaults, WpctlAudioRuntime},
     bluez::{AdapterInfo, BluetoothCtlBluez},
-    systemd::{SystemdUserRuntime, UserServiceStatus},
+    systemd::{ManagedBackendStatus, SystemdUserRuntime, UserServiceStatus},
 };
 
 pub async fn collect_report(
@@ -54,6 +54,9 @@ pub async fn collect_report(
     let wireplumber = systemd.service_status("wireplumber.service").await.ok();
     checks.push(wireplumber_check(wireplumber.as_ref()));
 
+    let backend = systemd.managed_backend_status().await.ok();
+    checks.push(managed_backend_check(backend.as_ref()));
+
     let defaults = audio.pipewire_defaults().await.ok();
     checks.push(pipewire_defaults_check(defaults.as_ref()));
 
@@ -75,6 +78,7 @@ pub async fn collect_report(
         adapter_info.as_ref(),
         defaults.as_ref(),
         wireplumber.as_ref(),
+        backend.as_ref(),
     ));
 
     Ok(DiagnosticsReport {
@@ -169,6 +173,62 @@ fn wireplumber_check(status: Option<&UserServiceStatus>) -> DiagnosticCheck {
             ),
             remediation: Some(
                 "Make sure WirePlumber is installed and running in the current user session."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn managed_backend_check(status: Option<&ManagedBackendStatus>) -> DiagnosticCheck {
+    match status {
+        Some(status) if status.installed && status.wireplumber_audio_profile => DiagnosticCheck {
+            code: "orators.backend_install".to_string(),
+            severity: Severity::Info,
+            summary: "The managed Orators Bluetooth-audio backend is installed".to_string(),
+            detail: Some(format!(
+                "wireplumber.service override is present at {} and the live ExecStart currently includes `-p audio`.",
+                status.wireplumber_dropin_path.display()
+            )),
+            remediation: None,
+        },
+        Some(status) if status.installed => DiagnosticCheck {
+            code: "orators.backend_install".to_string(),
+            severity: Severity::Warn,
+            summary: "The managed backend files are installed, but WirePlumber is not yet in audio-only mode".to_string(),
+            detail: Some(format!(
+                "Expected override at {}. The daemon unit exists at {}.",
+                status.wireplumber_dropin_path.display(),
+                status.unit_path.display()
+            )),
+            remediation: Some(
+                "Restart `wireplumber.service` and `oratorsd.service` while no Bluetooth audio devices are connected."
+                    .to_string(),
+            ),
+        },
+        Some(status) => DiagnosticCheck {
+            code: "orators.backend_install".to_string(),
+            severity: Severity::Warn,
+            summary: "The managed Orators Bluetooth-audio backend is not installed".to_string(),
+            detail: Some(format!(
+                "Expected daemon unit at {} and WirePlumber override at {}.",
+                status.unit_path.display(),
+                status.wireplumber_dropin_path.display()
+            )),
+            remediation: Some(
+                "Run `oratorsctl install-host-backend` before relying on the owned-backend MVP path."
+                    .to_string(),
+            ),
+        },
+        None => DiagnosticCheck {
+            code: "orators.backend_install".to_string(),
+            severity: Severity::Warn,
+            summary: "The managed backend installation could not be inspected".to_string(),
+            detail: Some(
+                "Orators could not determine whether its wireplumber.service override is installed."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "Run `oratorsctl install-host-backend` if you want Orators to own Bluetooth audio instead of the stock WirePlumber Bluetooth path."
                     .to_string(),
             ),
         },
@@ -339,12 +399,15 @@ fn host_support_check(
     adapter: Option<&AdapterInfo>,
     defaults: Option<&PipeWireDefaults>,
     wireplumber: Option<&UserServiceStatus>,
+    backend: Option<&ManagedBackendStatus>,
 ) -> DiagnosticCheck {
     let ready = adapter.is_some_and(adapter_supports_media)
         && defaults
             .is_some_and(|defaults| defaults.output_device.is_some() && !defaults.output_is_dummy)
         && wireplumber
             .is_some_and(|status| status.active_state == "active" && status.sub_state == "running");
+    let owned_backend_ready =
+        backend.is_some_and(|status| status.installed && status.wireplumber_audio_profile);
 
     DiagnosticCheck {
         code: "host.media_support".to_string(),
@@ -358,10 +421,13 @@ fn host_support_check(
         } else {
             "This host is not ready for config-free Bluetooth speaker playback".to_string()
         },
-        detail: Some(
-            "Orators relies on the host's stock BlueZ, PipeWire, and WirePlumber setup. It will not write WirePlumber config files or saved runtime settings."
-                .to_string(),
-        ),
+        detail: Some(if owned_backend_ready {
+            "The desktop audio session is healthy and the managed WirePlumber audio-only profile is active. This is the intended direction for the app-owned Bluetooth media backend."
+                .to_string()
+        } else {
+            "The desktop audio session is healthy enough for the current stock-host runtime path, but the managed owned-backend install is not fully active yet."
+                .to_string()
+        }),
         remediation: (!ready).then_some(
             "Fix the host audio stack first. Orators will refuse pairing or connection attempts on unsupported or unhealthy hosts."
                 .to_string(),

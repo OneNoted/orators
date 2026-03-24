@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use orators_core::{
     AudioDefaults, BluetoothProfile, DeviceInfo, DiagnosticsReport, OratorsConfig, OratorsState,
 };
+use orators_linux::systemd::ManagedBackendStatus;
 use tokio::sync::Mutex;
 
 #[async_trait]
@@ -22,6 +23,9 @@ pub trait PlatformRuntime: Send + Sync {
     async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()>;
     async fn diagnostics(&self) -> Result<DiagnosticsReport>;
     async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf>;
+    async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus>;
+    async fn uninstall_host_backend(&self) -> Result<()>;
+    async fn managed_backend_status(&self) -> Result<ManagedBackendStatus>;
 }
 
 #[async_trait]
@@ -76,6 +80,18 @@ impl PlatformRuntime for orators_linux::LinuxPlatform {
 
     async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {
         self.install_user_service(daemon_path).await
+    }
+
+    async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus> {
+        self.install_host_backend(daemon_path).await
+    }
+
+    async fn uninstall_host_backend(&self) -> Result<()> {
+        self.uninstall_host_backend().await
+    }
+
+    async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
+        self.managed_backend_status().await
     }
 }
 
@@ -216,6 +232,18 @@ impl<R: PlatformRuntime> OratorsService<R> {
         Ok(unit_path.display().to_string())
     }
 
+    pub async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus> {
+        self.runtime.install_host_backend(daemon_path).await
+    }
+
+    pub async fn uninstall_host_backend(&self) -> Result<()> {
+        self.runtime.uninstall_host_backend().await
+    }
+
+    pub async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
+        self.runtime.managed_backend_status().await
+    }
+
     pub async fn protect_active_audio_if_needed(&self) -> Result<Option<String>> {
         let active_device = {
             self.state
@@ -306,6 +334,7 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
+    use orators_linux::systemd::ManagedBackendStatus;
     use orators_core::{
         AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, OratorsConfig, Severity,
     };
@@ -431,6 +460,32 @@ mod tests {
 
         async fn install_user_service(&self, _daemon_path: &Path) -> Result<PathBuf> {
             Ok(PathBuf::from("/tmp/oratorsd.service"))
+        }
+
+        async fn install_host_backend(&self, _daemon_path: &Path) -> Result<ManagedBackendStatus> {
+            Ok(ManagedBackendStatus {
+                installed: true,
+                wireplumber_audio_profile: true,
+                unit_path: PathBuf::from("/tmp/oratorsd.service"),
+                wireplumber_dropin_path: PathBuf::from(
+                    "/tmp/wireplumber.service.d/90-orators-audio-owner.conf",
+                ),
+            })
+        }
+
+        async fn uninstall_host_backend(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
+            Ok(ManagedBackendStatus {
+                installed: true,
+                wireplumber_audio_profile: true,
+                unit_path: PathBuf::from("/tmp/oratorsd.service"),
+                wireplumber_dropin_path: PathBuf::from(
+                    "/tmp/wireplumber.service.d/90-orators-audio-owner.conf",
+                ),
+            })
         }
     }
 
