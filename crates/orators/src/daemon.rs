@@ -34,9 +34,6 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
             if let Err(error) = monitor_service.expire_pairing_if_needed().await {
                 tracing::warn!(?error, "failed to expire pairing window");
             }
-            if let Err(error) = monitor_service.protect_active_audio_if_needed().await {
-                tracing::warn!(?error, "failed to protect active bluetooth audio");
-            }
         }
     });
 

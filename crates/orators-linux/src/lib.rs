@@ -102,6 +102,8 @@ impl LinuxPlatform {
             anyhow::bail!("PipeWire does not currently have a usable default sink");
         }
 
+        self.audio.disable_headset_autoswitch().await?;
+
         Ok(())
     }
 

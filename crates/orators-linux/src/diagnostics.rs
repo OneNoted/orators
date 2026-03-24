@@ -2,7 +2,7 @@ use anyhow::Result;
 use orators_core::{DiagnosticCheck, DiagnosticsReport, Severity};
 
 use crate::{
-    audio::{BluetoothCard, PipeWireDefaults, WpctlAudioRuntime},
+    audio::{BluetoothCard, BluetoothRuntimeSettings, PipeWireDefaults, WpctlAudioRuntime},
     bluez::{AdapterInfo, BluetoothCtlBluez},
     systemd::{SystemdUserRuntime, UserServiceStatus},
 };
@@ -56,6 +56,9 @@ pub async fn collect_report(
 
     let defaults = audio.pipewire_defaults().await.ok();
     checks.push(pipewire_defaults_check(defaults.as_ref()));
+
+    let runtime_settings = audio.bluetooth_runtime_settings().await.ok();
+    checks.push(headset_autoswitch_check(runtime_settings.as_ref()));
 
     let bluetooth_cards = audio.bluetooth_cards().await.ok();
     let active_device = bluez
@@ -214,6 +217,47 @@ fn pipewire_defaults_check(defaults: Option<&PipeWireDefaults>) -> DiagnosticChe
     }
 }
 
+fn headset_autoswitch_check(settings: Option<&BluetoothRuntimeSettings>) -> DiagnosticCheck {
+    match settings.and_then(|settings| settings.headset_autoswitch) {
+        Some(false) => DiagnosticCheck {
+            code: "wireplumber.bluetooth_autoswitch".to_string(),
+            severity: Severity::Info,
+            summary: "Bluetooth headset autoswitch is disabled at runtime".to_string(),
+            detail: Some(
+                "This host stays on the high-quality A2DP media profile instead of switching Bluetooth devices into headset mode when a recording stream appears."
+                    .to_string(),
+            ),
+            remediation: None,
+        },
+        Some(true) => DiagnosticCheck {
+            code: "wireplumber.bluetooth_autoswitch".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth headset autoswitch is enabled at runtime".to_string(),
+            detail: Some(
+                "On WirePlumber 0.5.x, automatic headset-profile switching can destabilize media-only Bluetooth speaker use."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "Orators will disable this setting at runtime before pairing or connecting devices."
+                    .to_string(),
+            ),
+        },
+        None => DiagnosticCheck {
+            code: "wireplumber.bluetooth_autoswitch".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth headset autoswitch state could not be inspected".to_string(),
+            detail: Some(
+                "wpctl could not read the `bluetooth.autoswitch-to-headset-profile` runtime setting."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "Make sure WirePlumber is healthy before using Orators with Bluetooth audio."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
 fn active_profile_check(
     active_device_address: Option<&str>,
     cards: Option<&[BluetoothCard]>,
@@ -271,7 +315,7 @@ fn active_profile_check(
                 "Connected device {address} is currently on profile `{profile}`."
             )),
             remediation: Some(
-                "Orators will try to pin the device back to A2DP at runtime. If drift continues, it will disconnect the active Bluetooth audio device to protect the host audio session."
+                "Disconnect and reconnect the device if media playback does not return to A2DP on its own."
                     .to_string(),
             ),
         },

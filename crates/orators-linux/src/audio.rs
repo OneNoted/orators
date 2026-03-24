@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{process::Output, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use orators_core::{AudioDefaults, BluetoothProfile};
@@ -7,11 +7,19 @@ use tokio::process::Command;
 
 pub struct WpctlAudioRuntime;
 
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const HEADSET_AUTOSWITCH_SETTING: &str = "bluetooth.autoswitch-to-headset-profile";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipeWireDefaults {
     pub output_device: Option<String>,
     pub input_device: Option<String>,
     pub output_is_dummy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BluetoothRuntimeSettings {
+    pub headset_autoswitch: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,10 +103,7 @@ impl WpctlAudioRuntime {
     }
 
     pub async fn bluetooth_cards(&self) -> Result<Vec<BluetoothCard>> {
-        let output = Command::new("pw-dump")
-            .output()
-            .await
-            .context("failed to invoke pw-dump")?;
+        let output = run_command("pw-dump", &[]).await?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -148,6 +153,32 @@ impl WpctlAudioRuntime {
         }
     }
 
+    pub async fn bluetooth_runtime_settings(&self) -> Result<BluetoothRuntimeSettings> {
+        let output = run_command("wpctl", &["settings", HEADSET_AUTOSWITCH_SETTING]).await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "wpctl settings {HEADSET_AUTOSWITCH_SETTING} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        Ok(BluetoothRuntimeSettings {
+            headset_autoswitch: parse_wpctl_setting_bool(&String::from_utf8_lossy(&output.stdout)),
+        })
+    }
+
+    pub async fn disable_headset_autoswitch(&self) -> Result<()> {
+        let output =
+            run_command("wpctl", &["settings", HEADSET_AUTOSWITCH_SETTING, "false"]).await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "wpctl settings {HEADSET_AUTOSWITCH_SETTING} false failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     async fn find_bluetooth_card(&self, address: &str) -> Result<BluetoothCard> {
         self.bluetooth_cards()
             .await?
@@ -188,13 +219,7 @@ impl WpctlAudioRuntime {
 
         let card_id = card.id.to_string();
         let profile_index = profile.index.to_string();
-        let output = Command::new("wpctl")
-            .args(["set-profile", &card_id, &profile_index])
-            .output()
-            .await
-            .with_context(|| {
-                format!("failed to invoke wpctl set-profile {card_id} {profile_index}")
-            })?;
+        let output = run_command("wpctl", &["set-profile", &card_id, &profile_index]).await?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -216,11 +241,7 @@ struct StatusDefaults {
 }
 
 async fn inspect_wpctl(target: &str) -> Result<String> {
-    let output = Command::new("wpctl")
-        .args(["inspect", target])
-        .output()
-        .await
-        .with_context(|| format!("failed to invoke wpctl inspect {target}"))?;
+    let output = run_command("wpctl", &["inspect", target]).await?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -246,11 +267,7 @@ pub fn parse_wpctl_inspect(output: &str) -> Option<String> {
 }
 
 async fn inspect_wpctl_status_defaults() -> Result<StatusDefaults> {
-    let output = Command::new("wpctl")
-        .arg("status")
-        .output()
-        .await
-        .context("failed to invoke wpctl status")?;
+    let output = run_command("wpctl", &["status"]).await?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -285,6 +302,36 @@ fn parse_wpctl_status_defaults(output: &str) -> StatusDefaults {
     }
 
     defaults
+}
+
+fn parse_wpctl_setting_bool(output: &str) -> Option<bool> {
+    output.lines().map(str::trim).find_map(|line| {
+        let value = line.strip_prefix("Value:")?.trim();
+        match value {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+async fn run_command(program: &str, args: &[&str]) -> Result<Output> {
+    run_spawned_command(
+        {
+            let mut command = Command::new(program);
+            command.args(args);
+            command
+        },
+        format!("{program} {}", args.join(" ")).trim().to_string(),
+    )
+    .await
+}
+
+async fn run_spawned_command(mut command: Command, label: String) -> Result<Output> {
+    tokio::time::timeout(COMMAND_TIMEOUT, command.output())
+        .await
+        .with_context(|| format!("{label} timed out after {}s", COMMAND_TIMEOUT.as_secs()))?
+        .with_context(|| format!("failed to invoke {label}"))
 }
 
 fn parse_pw_dump_bluetooth_cards(output: &str) -> Option<Vec<BluetoothCard>> {
@@ -408,7 +455,7 @@ fn profile_name_to_kind(name: &str) -> Option<BluetoothProfile> {
 mod tests {
     use super::{
         extract_bluetooth_address, parse_pw_dump_bluetooth_cards, parse_wpctl_inspect,
-        parse_wpctl_status_defaults,
+        parse_wpctl_setting_bool, parse_wpctl_status_defaults,
     };
 
     #[test]
@@ -437,6 +484,12 @@ Settings
         let defaults = parse_wpctl_status_defaults(output);
         assert_eq!(defaults.output_device.as_deref(), Some("alsa_output.test"));
         assert_eq!(defaults.input_device.as_deref(), Some("alsa_input.test"));
+    }
+
+    #[test]
+    fn parses_boolean_wpctl_setting() {
+        assert_eq!(parse_wpctl_setting_bool("Value: true\n"), Some(true));
+        assert_eq!(parse_wpctl_setting_bool("Value: false\n"), Some(false));
     }
 
     #[test]

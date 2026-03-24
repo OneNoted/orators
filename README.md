@@ -38,7 +38,7 @@ nix flake check
 - `oratorsd` relies on the host's stock BlueZ, PipeWire, and WirePlumber setup
 - Orators does not write WirePlumber fragments, saved `wpctl` settings, or other PipeWire session config
 - Supported baseline is media-only Bluetooth speaker playback
-- When a Bluetooth audio card appears, Orators pins it back to A2DP at runtime and disconnects the active Bluetooth audio device if the host audio session becomes unhealthy
+- Before pairing or connecting, Orators disables WirePlumber's Bluetooth headset autoswitch at runtime and pins newly connected Bluetooth audio cards back to A2DP
 
 ## Host Model
 
@@ -64,4 +64,4 @@ Legacy Bluetooth-mode fields are still ignored on load so existing configs remai
 1. Run `oratorsctl doctor` before pairing or connecting a phone.
 2. If doctor reports that the host audio stack is unsupported or unhealthy, fix the host outside Orators first.
 3. Orators will not restart WirePlumber or PipeWire automatically.
-4. If the active Bluetooth device drifts into a non-A2DP profile or the user-session audio stack collapses, Orators disconnects only the active Bluetooth audio device and leaves the rest of the desktop stack alone.
+4. Orators does not write WirePlumber config or saved `wpctl` settings. Its Bluetooth stability workaround is runtime-only and applies to the current WirePlumber session.
