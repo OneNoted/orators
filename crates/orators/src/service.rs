@@ -334,10 +334,10 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use orators_linux::systemd::ManagedBackendStatus;
     use orators_core::{
         AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, OratorsConfig, Severity,
     };
+    use orators_linux::systemd::ManagedBackendStatus;
 
     use super::{OratorsService, PlatformRuntime};
 

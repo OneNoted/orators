@@ -45,6 +45,7 @@ nix flake check
 - The user session must have a healthy PipeWire setup with a real default sink
 - The stock BlueZ system service must be healthy
 - For the app-owned Bluetooth path, `wireplumber.service` should be running in the official `audio` profile instead of owning Bluetooth itself
+- The owned-backend MVP path currently shells out to system `ffmpeg` and `pw-play` for decode and local playback
 - Orators will not write ad hoc WirePlumber or PipeWire policy files to repair the desktop
 
 ## Configuration
@@ -65,4 +66,5 @@ Legacy Bluetooth-mode fields are still ignored on load so existing configs remai
 2. Restart `wireplumber.service` and `oratorsd.service` only when no Bluetooth audio devices are connected.
 3. Run `oratorsctl doctor` before pairing or connecting a phone.
 4. If doctor reports that the host audio stack is unsupported or unhealthy, fix the host outside Orators first.
-5. Orators will not write WirePlumber fragments, saved `wpctl` settings, or other PipeWire session policy files.
+5. If you are using the owned-backend MVP path, make sure `ffmpeg` and `pw-play` are installed in the user environment.
+6. Orators will not write WirePlumber fragments, saved `wpctl` settings, or other PipeWire session policy files.

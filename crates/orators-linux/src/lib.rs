@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod bluez;
 pub mod diagnostics;
+pub mod owned_backend;
 pub mod systemd;
 
 use std::path::{Path, PathBuf};
@@ -12,22 +13,36 @@ use crate::{
     audio::WpctlAudioRuntime,
     bluez::BluetoothCtlBluez,
     diagnostics::collect_report,
+    owned_backend::OwnedBluetoothMediaBackend,
     systemd::{ManagedBackendStatus, SystemdUserRuntime},
 };
 
 pub struct LinuxPlatform {
     bluez: BluetoothCtlBluez,
     audio: WpctlAudioRuntime,
+    owned_backend: Option<OwnedBluetoothMediaBackend>,
     systemd: SystemdUserRuntime,
     config: OratorsConfig,
 }
 
 impl LinuxPlatform {
     pub async fn new(config: OratorsConfig) -> Result<Self> {
+        let systemd = SystemdUserRuntime;
+        let managed_backend = systemd.managed_backend_status().await.ok();
+        let owned_backend = if managed_backend
+            .as_ref()
+            .is_some_and(|status| status.installed && status.wireplumber_audio_profile)
+        {
+            Some(OwnedBluetoothMediaBackend::new().await?)
+        } else {
+            None
+        };
+
         Ok(Self {
             bluez: BluetoothCtlBluez::new().await?,
             audio: WpctlAudioRuntime,
-            systemd: SystemdUserRuntime,
+            owned_backend,
+            systemd,
             config,
         })
     }
@@ -60,7 +75,11 @@ impl LinuxPlatform {
     pub async fn connect_device(&self, address: &str) -> Result<()> {
         self.ensure_host_media_ready().await?;
         self.bluez.connect_device(address).await?;
-        self.audio.pin_device_to_a2dp(address).await
+        if self.owned_backend.is_some() {
+            Ok(())
+        } else {
+            self.audio.pin_device_to_a2dp(address).await
+        }
     }
 
     pub async fn disconnect_device(&self, address: &str) -> Result<()> {
@@ -77,13 +96,18 @@ impl LinuxPlatform {
             .and_then(|devices| devices.into_iter().find(|device| device.connected))
             .map(|device| device.address);
 
-        self.audio
+        let mut defaults = self
+            .audio
             .current_defaults(
                 adapter.as_ref().is_some_and(adapter_supports_media),
                 adapter.as_ref().is_some_and(adapter_exposes_call_roles),
                 active_device.as_deref(),
             )
-            .await
+            .await?;
+        if self.owned_backend.is_some() {
+            defaults.call_roles_detected = false;
+        }
+        Ok(defaults)
     }
 
     pub async fn ensure_host_media_ready(&self) -> Result<()> {
@@ -129,7 +153,13 @@ impl LinuxPlatform {
     }
 
     pub async fn diagnostics(&self) -> Result<DiagnosticsReport> {
-        collect_report(&self.bluez, &self.audio, &self.systemd).await
+        collect_report(
+            &self.bluez,
+            &self.audio,
+            self.owned_backend.as_ref(),
+            &self.systemd,
+        )
+        .await
     }
 
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {

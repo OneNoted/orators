@@ -4,12 +4,14 @@ use orators_core::{DiagnosticCheck, DiagnosticsReport, Severity};
 use crate::{
     audio::{BluetoothCard, BluetoothRuntimeSettings, PipeWireDefaults, WpctlAudioRuntime},
     bluez::{AdapterInfo, BluetoothCtlBluez},
+    owned_backend::OwnedBluetoothMediaBackend,
     systemd::{ManagedBackendStatus, SystemdUserRuntime, UserServiceStatus},
 };
 
 pub async fn collect_report(
     bluez: &BluetoothCtlBluez,
     audio: &WpctlAudioRuntime,
+    owned_backend: Option<&OwnedBluetoothMediaBackend>,
     systemd: &SystemdUserRuntime,
 ) -> Result<DiagnosticsReport> {
     let mut checks = Vec::new();
@@ -56,6 +58,15 @@ pub async fn collect_report(
 
     let backend = systemd.managed_backend_status().await.ok();
     checks.push(managed_backend_check(backend.as_ref()));
+    let runtime_backend = if let Some(backend) = owned_backend {
+        Some(backend.snapshot().await)
+    } else {
+        None
+    };
+    checks.push(owned_backend_runtime_check(
+        backend.as_ref(),
+        runtime_backend.as_ref(),
+    ));
 
     let defaults = audio.pipewire_defaults().await.ok();
     checks.push(pipewire_defaults_check(defaults.as_ref()));
@@ -85,6 +96,70 @@ pub async fn collect_report(
         generated_at_epoch_secs: crate::now_epoch_secs(),
         checks,
     })
+}
+
+fn owned_backend_runtime_check(
+    install_status: Option<&ManagedBackendStatus>,
+    runtime_status: Option<&crate::owned_backend::OwnedBackendSnapshot>,
+) -> DiagnosticCheck {
+    if let Some(runtime) = runtime_status {
+        return DiagnosticCheck {
+            code: "orators.backend_runtime".to_string(),
+            severity: if runtime.endpoints_registered {
+                Severity::Info
+            } else {
+                Severity::Warn
+            },
+            summary: if runtime.endpoints_registered {
+                "Orators owns the Bluetooth media endpoint registration".to_string()
+            } else {
+                "Orators started without registering Bluetooth media endpoints".to_string()
+            },
+            detail: Some(format!(
+                "endpoints_registered={}, active_codec={}, transport_acquired={}, playback_connected={}.{}",
+                runtime.endpoints_registered,
+                runtime
+                    .active_codec
+                    .map(|codec| format!("{codec:?}").to_lowercase())
+                    .unwrap_or_else(|| "none".to_string()),
+                runtime.transport_acquired,
+                runtime.playback_connected,
+                runtime
+                    .last_error
+                    .as_ref()
+                    .map(|error| format!(" last_error={error}"))
+                    .unwrap_or_default()
+            )),
+            remediation: (!runtime.endpoints_registered).then_some(
+                "Check BlueZ logs and confirm the managed backend is installed before expecting Orators-owned Bluetooth playback."
+                    .to_string(),
+            ),
+        };
+    }
+
+    DiagnosticCheck {
+        code: "orators.backend_runtime".to_string(),
+        severity: if install_status.is_some_and(|status| status.installed) {
+            Severity::Warn
+        } else {
+            Severity::Info
+        },
+        summary: if install_status.is_some_and(|status| status.installed) {
+            "The managed backend is installed, but the owned Bluetooth runtime is not active in this daemon instance".to_string()
+        } else {
+            "The owned Bluetooth runtime is not active".to_string()
+        },
+        detail: Some(
+            "Orators only starts its BlueZ MediaEndpoint backend when the managed `wireplumber -p audio` install is active before daemon startup."
+                .to_string(),
+        ),
+        remediation: install_status
+            .is_some_and(|status| status.installed)
+            .then_some(
+                "Restart `oratorsd.service` after activating the managed backend so Orators can register its endpoints."
+                    .to_string(),
+            ),
+    }
 }
 
 fn media_role_check(adapter: Option<&AdapterInfo>) -> DiagnosticCheck {
