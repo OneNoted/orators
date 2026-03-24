@@ -27,10 +27,20 @@ pub struct AdapterInfo {
     pub address: Option<String>,
     pub alias: Option<String>,
     pub name: Option<String>,
+    pub uuids: Vec<String>,
     pub powered: bool,
     pub discoverable: bool,
     pub pairable: bool,
     pub discovering: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDeviceInfo {
+    pub address: String,
+    pub alias: Option<String>,
+    pub paired: bool,
+    pub connected: bool,
+    pub uuids: Vec<String>,
 }
 
 pub struct BluetoothCtlBluez {
@@ -74,6 +84,7 @@ impl BluetoothCtlBluez {
             address: string_prop(adapter, "Address"),
             alias: string_prop(adapter, "Alias"),
             name: string_prop(adapter, "Name"),
+            uuids: string_array_prop(adapter, "UUIDs").unwrap_or_default(),
             powered: bool_prop(adapter, "Powered").unwrap_or(false),
             discoverable: bool_prop(adapter, "Discoverable").unwrap_or(false),
             pairable: bool_prop(adapter, "Pairable").unwrap_or(false),
@@ -84,6 +95,11 @@ impl BluetoothCtlBluez {
     pub async fn list_devices(&self, auto_reconnect: bool) -> Result<Vec<DeviceInfo>> {
         let managed = self.managed_objects().await?;
         Ok(parse_devices(&managed, auto_reconnect))
+    }
+
+    pub async fn remote_devices(&self) -> Result<Vec<RemoteDeviceInfo>> {
+        let managed = self.managed_objects().await?;
+        Ok(parse_remote_devices(&managed))
     }
 
     pub async fn start_pairing(&self, timeout_secs: u64) -> Result<()> {
@@ -538,6 +554,13 @@ fn bool_prop(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<bool
         .and_then(|value| bool::try_from(value).ok())
 }
 
+fn string_array_prop(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<Vec<String>> {
+    properties
+        .get(key)
+        .and_then(|value| value.try_clone().ok())
+        .and_then(|value| <Vec<String>>::try_from(value).ok())
+}
+
 fn object_path_prop(
     properties: &HashMap<String, OwnedValue>,
     key: &str,
@@ -546,6 +569,22 @@ fn object_path_prop(
         .get(key)
         .and_then(|value| value.try_clone().ok())
         .and_then(|value| OwnedObjectPath::try_from(value).ok())
+}
+
+fn parse_remote_devices(managed: &ManagedObjects) -> Vec<RemoteDeviceInfo> {
+    managed
+        .values()
+        .filter_map(|interfaces| interfaces.get("org.bluez.Device1"))
+        .filter_map(|properties| {
+            Some(RemoteDeviceInfo {
+                address: string_prop(properties, "Address")?,
+                alias: string_prop(properties, "Alias").or_else(|| string_prop(properties, "Name")),
+                paired: bool_prop(properties, "Paired").unwrap_or(false),
+                connected: bool_prop(properties, "Connected").unwrap_or(false),
+                uuids: string_array_prop(properties, "UUIDs").unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -664,6 +703,7 @@ mod tests {
             address: Some("04:7F:0E:02:13:3C".to_string()),
             alias: Some("aeolus".to_string()),
             name: Some("aeolus".to_string()),
+            uuids: Vec::new(),
             powered: true,
             discoverable: true,
             pairable: true,

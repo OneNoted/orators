@@ -1,13 +1,15 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use orators_core::{OratorsConfig, SessionConfigStatus};
+use orators_core::{BluetoothMode, OratorsConfig, SessionConfigStatus};
 use tokio::fs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WirePlumberRoles {
     pub a2dp_sink_enabled: bool,
-    pub hfp_hf_enabled: bool,
+    pub classic_call_enabled: bool,
+    pub le_audio_enabled: bool,
+    pub autoswitch_to_headset_profile: Option<bool>,
 }
 
 pub struct WirePlumberRuntime;
@@ -61,18 +63,23 @@ impl WirePlumberRuntime {
 }
 
 pub fn render_fragment(config: &OratorsConfig) -> String {
-    let roles = if config.call_audio_enabled {
-        "a2dp_sink hsp_hs hfp_hf"
-    } else {
-        "a2dp_sink"
+    let roles = match config.bluetooth_mode {
+        BluetoothMode::ClassicMedia => "a2dp_sink",
+        BluetoothMode::ClassicCall => "a2dp_sink hsp_hs hfp_hf",
+        BluetoothMode::ExperimentalLeAudio => "a2dp_sink bap_sink bap_source",
     };
     let mut fragment = format!(
-        r#"monitor.bluez.properties = {{
+        r#"wireplumber.settings = {{
+  bluetooth.autoswitch-to-headset-profile = {}
+}}
+
+monitor.bluez.properties = {{
   bluez5.roles = [ {roles} ]
-"#
+"#,
+        bool_literal(config.bluetooth_mode.headset_autoswitch_enabled())
     );
 
-    if config.call_audio_enabled {
+    if config.bluetooth_mode.classic_call_enabled() {
         fragment.push_str(
             r#"  bluez5.hfphsp-backend = "native"
   bluez5.enable-msbc = true
@@ -81,7 +88,8 @@ pub fn render_fragment(config: &OratorsConfig) -> String {
     }
 
     fragment.push_str(
-        r#"}
+        r#"
+}
 
 monitor.bluez.rules = [
   {
@@ -107,33 +115,54 @@ monitor.bluez.rules = [
 pub fn parse_roles(contents: &str) -> WirePlumberRoles {
     WirePlumberRoles {
         a2dp_sink_enabled: contents.contains("a2dp_sink"),
-        hfp_hf_enabled: contents.contains("hfp_hf") || contents.contains("hsp_hs"),
+        classic_call_enabled: contents.contains("hfp_hf") || contents.contains("hsp_hs"),
+        le_audio_enabled: contents.contains("bap_sink") || contents.contains("bap_source"),
+        autoswitch_to_headset_profile: parse_autoswitch_setting(contents),
     }
+}
+
+fn parse_autoswitch_setting(contents: &str) -> Option<bool> {
+    contents.lines().map(str::trim).find_map(|line| {
+        let value = line.strip_prefix("bluetooth.autoswitch-to-headset-profile = ")?;
+        match value {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn bool_literal(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
 }
 
 #[cfg(test)]
 mod tests {
-    use orators_core::OratorsConfig;
+    use orators_core::{BluetoothMode, OratorsConfig};
 
     use super::{parse_roles, render_fragment};
 
     #[test]
-    fn default_fragment_enables_dynamic_call_support() {
+    fn default_fragment_is_media_first() {
         let roles = parse_roles(&render_fragment(&OratorsConfig::default()));
         assert!(roles.a2dp_sink_enabled);
-        assert!(roles.hfp_hf_enabled);
+        assert!(!roles.classic_call_enabled);
+        assert!(!roles.le_audio_enabled);
+        assert_eq!(roles.autoswitch_to_headset_profile, Some(false));
     }
 
     #[test]
-    fn call_audio_fragment_enables_hfp_without_auto_connecting_it() {
+    fn classic_call_fragment_enables_hfp_without_auto_connecting_it() {
         let fragment = render_fragment(&OratorsConfig {
-            call_audio_enabled: true,
+            bluetooth_mode: BluetoothMode::ClassicCall,
             ..OratorsConfig::default()
         });
         let roles = parse_roles(&fragment);
 
         assert!(roles.a2dp_sink_enabled);
-        assert!(roles.hfp_hf_enabled);
+        assert!(roles.classic_call_enabled);
+        assert!(!roles.le_audio_enabled);
+        assert_eq!(roles.autoswitch_to_headset_profile, Some(true));
         assert!(fragment.contains("device.profile = \"a2dp-sink\""));
         assert!(fragment.contains("bluez5.auto-connect = [ a2dp_sink ]"));
         assert!(fragment.contains("hsp_hs"));
@@ -142,12 +171,29 @@ mod tests {
     #[test]
     fn media_only_fragment_disables_hfp_explicitly() {
         let fragment = render_fragment(&OratorsConfig {
-            call_audio_enabled: false,
+            bluetooth_mode: BluetoothMode::ClassicMedia,
             ..OratorsConfig::default()
         });
         let roles = parse_roles(&fragment);
 
         assert!(roles.a2dp_sink_enabled);
-        assert!(!roles.hfp_hf_enabled);
+        assert!(!roles.classic_call_enabled);
+        assert_eq!(roles.autoswitch_to_headset_profile, Some(false));
+    }
+
+    #[test]
+    fn experimental_le_audio_fragment_enables_bap_roles_with_a2dp_fallback() {
+        let fragment = render_fragment(&OratorsConfig {
+            bluetooth_mode: BluetoothMode::ExperimentalLeAudio,
+            ..OratorsConfig::default()
+        });
+        let roles = parse_roles(&fragment);
+
+        assert!(roles.a2dp_sink_enabled);
+        assert!(!roles.classic_call_enabled);
+        assert!(roles.le_audio_enabled);
+        assert_eq!(roles.autoswitch_to_headset_profile, Some(false));
+        assert!(fragment.contains("bap_sink"));
+        assert!(fragment.contains("bap_source"));
     }
 }

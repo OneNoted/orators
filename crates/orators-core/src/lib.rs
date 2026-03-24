@@ -5,7 +5,7 @@ pub mod error;
 pub mod state;
 pub mod types;
 
-pub use config::OratorsConfig;
+pub use config::{BluetoothMode, OratorsConfig};
 pub use diagnostics::{DiagnosticCheck, DiagnosticsReport, Severity};
 pub use error::{OratorsError, Result};
 pub use state::OratorsState;

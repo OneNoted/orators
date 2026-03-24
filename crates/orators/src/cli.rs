@@ -246,7 +246,7 @@ fn render_pairing_started(status: &RuntimeStatus, diagnostics: Option<&Diagnosti
         println!("Open Bluetooth settings on the phone and look for this computer.");
     }
 
-    render_audio_summary(status);
+    render_audio_summary(status, diagnostics);
     render_devices_summary(&status.devices);
 }
 
@@ -274,7 +274,7 @@ fn render_status(status: &RuntimeStatus, diagnostics: Option<&DiagnosticsReport>
         "Active device: {}",
         status.active_device.as_deref().unwrap_or("none")
     );
-    render_audio_summary(status);
+    render_audio_summary(status, diagnostics);
     render_devices_summary(&status.devices);
 }
 
@@ -310,7 +310,10 @@ fn render_devices_summary(devices: &[orators_core::DeviceInfo]) {
     println!("Connected: {connected}. Trusted: {trusted}.");
 }
 
-fn render_audio_summary(status: &RuntimeStatus) {
+fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&DiagnosticsReport>) {
+    if let Some(mode) = diagnostics.and_then(bluetooth_mode_summary) {
+        println!("Bluetooth mode: {mode}");
+    }
     println!(
         "Audio output: {}",
         status
@@ -328,18 +331,25 @@ fn render_audio_summary(status: &RuntimeStatus) {
             .unwrap_or("not detected")
     );
     println!(
-        "Bluetooth roles: a2dp_sink={}, headset_call={}",
+        "Bluetooth transports: a2dp_sink={}, classic_call={}",
         yes_no(status.audio.a2dp_sink_enabled),
         yes_no(status.audio.hfp_hf_enabled),
     );
-    println!(
-        "Call audio: {}",
-        if status.audio.hfp_hf_enabled {
-            "available by default; media stays on A2DP until a voice app uses the microphone"
-        } else {
-            "disabled; Discord and other VoIP apps will not see a Bluetooth microphone path"
-        }
-    );
+    if let Some(summary) = diagnostics.and_then(audio_mode_detail) {
+        println!("Bluetooth policy: {summary}");
+    } else {
+        println!(
+            "Bluetooth policy: {}",
+            if status.audio.hfp_hf_enabled {
+                "classic bidirectional call support is exposed"
+            } else {
+                "speaker-first A2DP playback only"
+            }
+        );
+    }
+    if let Some(summary) = diagnostics.and_then(autoswitch_summary) {
+        println!("Headset autoswitch: {summary}");
+    }
 }
 
 fn render_doctor(report: &DiagnosticsReport) {
@@ -372,10 +382,33 @@ fn parse_optional_diagnostics(report: Option<String>) -> Option<DiagnosticsRepor
 }
 
 fn find_adapter_check(report: &DiagnosticsReport) -> Option<&DiagnosticCheck> {
-    report
-        .checks
-        .iter()
-        .find(|check| check.code == "bluez.adapter")
+    find_check(report, "bluez.adapter")
+}
+
+fn find_check<'a>(report: &'a DiagnosticsReport, code: &str) -> Option<&'a DiagnosticCheck> {
+    report.checks.iter().find(|check| check.code == code)
+}
+
+fn bluetooth_mode_summary(report: &DiagnosticsReport) -> Option<&str> {
+    find_check(report, "bluetooth.mode").map(|check| {
+        check
+            .summary
+            .strip_prefix("Bluetooth mode is ")
+            .unwrap_or(check.summary.as_str())
+    })
+}
+
+fn audio_mode_detail(report: &DiagnosticsReport) -> Option<&str> {
+    find_check(report, "bluetooth.mode").and_then(|check| check.detail.as_deref())
+}
+
+fn autoswitch_summary(report: &DiagnosticsReport) -> Option<&str> {
+    let check = find_check(report, "bluetooth.autoswitch")?;
+    if check.summary.contains("matches") {
+        check.detail.as_deref()
+    } else {
+        Some(check.summary.as_str())
+    }
 }
 
 fn severity_label(severity: &Severity) -> &'static str {

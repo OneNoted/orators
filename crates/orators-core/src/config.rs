@@ -1,19 +1,49 @@
 use std::{fs, path::Path};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     error::{OratorsError, Result},
     types::SessionConfigStatus,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BluetoothMode {
+    #[default]
+    ClassicMedia,
+    ClassicCall,
+    ExperimentalLeAudio,
+}
+
+impl BluetoothMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClassicMedia => "classic_media",
+            Self::ClassicCall => "classic_call",
+            Self::ExperimentalLeAudio => "experimental_le_audio",
+        }
+    }
+
+    pub fn classic_call_enabled(self) -> bool {
+        matches!(self, Self::ClassicCall)
+    }
+
+    pub fn le_audio_enabled(self) -> bool {
+        matches!(self, Self::ExperimentalLeAudio)
+    }
+
+    pub fn headset_autoswitch_enabled(self) -> bool {
+        matches!(self, Self::ClassicCall)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OratorsConfig {
     pub pairing_timeout_secs: u64,
     pub auto_reconnect: bool,
     pub single_active_device: bool,
-    pub call_audio_enabled: bool,
+    pub bluetooth_mode: BluetoothMode,
     pub wireplumber_fragment_name: String,
 }
 
@@ -23,9 +53,55 @@ impl Default for OratorsConfig {
             pairing_timeout_secs: 120,
             auto_reconnect: true,
             single_active_device: true,
-            call_audio_enabled: true,
+            bluetooth_mode: BluetoothMode::ClassicMedia,
             wireplumber_fragment_name: "90-orators-bluetooth.conf".to_string(),
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RawOratorsConfig {
+    pairing_timeout_secs: u64,
+    auto_reconnect: bool,
+    single_active_device: bool,
+    bluetooth_mode: Option<BluetoothMode>,
+    call_audio_enabled: Option<bool>,
+    wireplumber_fragment_name: String,
+}
+
+impl Default for RawOratorsConfig {
+    fn default() -> Self {
+        let defaults = OratorsConfig::default();
+        Self {
+            pairing_timeout_secs: defaults.pairing_timeout_secs,
+            auto_reconnect: defaults.auto_reconnect,
+            single_active_device: defaults.single_active_device,
+            bluetooth_mode: None,
+            call_audio_enabled: None,
+            wireplumber_fragment_name: defaults.wireplumber_fragment_name,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OratorsConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawOratorsConfig::deserialize(deserializer)?;
+        let bluetooth_mode = raw.bluetooth_mode.unwrap_or(match raw.call_audio_enabled {
+            Some(true) => BluetoothMode::ClassicCall,
+            Some(false) | None => BluetoothMode::ClassicMedia,
+        });
+
+        Ok(Self {
+            pairing_timeout_secs: raw.pairing_timeout_secs,
+            auto_reconnect: raw.auto_reconnect,
+            single_active_device: raw.single_active_device,
+            bluetooth_mode,
+            wireplumber_fragment_name: raw.wireplumber_fragment_name,
+        })
     }
 }
 
@@ -66,7 +142,7 @@ impl OratorsConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::OratorsConfig;
+    use super::{BluetoothMode, OratorsConfig};
 
     #[test]
     fn missing_new_fields_use_defaults() {
@@ -80,7 +156,40 @@ wireplumber_fragment_name = "90-orators-bluetooth.conf"
         )
         .unwrap();
 
-        assert!(parsed.call_audio_enabled);
+        assert_eq!(parsed.bluetooth_mode, BluetoothMode::ClassicMedia);
         assert_eq!(parsed.pairing_timeout_secs, 45);
+    }
+
+    #[test]
+    fn legacy_call_audio_enabled_maps_to_classic_call() {
+        let parsed: OratorsConfig = toml::from_str(
+            r#"
+call_audio_enabled = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.bluetooth_mode, BluetoothMode::ClassicCall);
+    }
+
+    #[test]
+    fn explicit_bluetooth_mode_wins_over_legacy_flag() {
+        let parsed: OratorsConfig = toml::from_str(
+            r#"
+bluetooth_mode = "experimental_le_audio"
+call_audio_enabled = false
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.bluetooth_mode, BluetoothMode::ExperimentalLeAudio);
+    }
+
+    #[test]
+    fn save_writes_bluetooth_mode_not_legacy_flag() {
+        let serialized = toml::to_string_pretty(&OratorsConfig::default()).unwrap();
+
+        assert!(serialized.contains("bluetooth_mode = \"classic_media\""));
+        assert!(!serialized.contains("call_audio_enabled"));
     }
 }
