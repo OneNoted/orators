@@ -97,6 +97,16 @@ impl OratorsState {
         Ok(())
     }
 
+    pub fn untrust_device(&mut self, address: &str) -> Result<()> {
+        let device = self
+            .devices
+            .get_mut(address)
+            .ok_or_else(|| OratorsError::UnknownDevice(address.to_string()))?;
+        device.trusted = false;
+        device.auto_reconnect = false;
+        Ok(())
+    }
+
     pub fn forget_device(&mut self, address: &str) -> Result<()> {
         if self.devices.remove(address).is_none() {
             return Err(OratorsError::UnknownDevice(address.to_string()));

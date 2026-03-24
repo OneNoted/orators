@@ -145,6 +145,19 @@ impl DbusApi {
         Ok(status)
     }
 
+    #[zbus(name = "UntrustDevice")]
+    async fn untrust_device(
+        &self,
+        address: &str,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let status = self.service.untrust_device(address).await.map_err(to_fdo)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(status)
+    }
+
     #[zbus(name = "ForgetDevice")]
     async fn forget_device(
         &self,

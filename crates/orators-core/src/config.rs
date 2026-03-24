@@ -9,6 +9,7 @@ pub struct OratorsConfig {
     pub pairing_timeout_secs: u64,
     pub auto_reconnect: bool,
     pub single_active_device: bool,
+    pub allowed_devices: Vec<String>,
 }
 
 impl Default for OratorsConfig {
@@ -17,6 +18,7 @@ impl Default for OratorsConfig {
             pairing_timeout_secs: 120,
             auto_reconnect: true,
             single_active_device: true,
+            allowed_devices: Vec::new(),
         }
     }
 }
@@ -27,6 +29,7 @@ struct RawOratorsConfig {
     pairing_timeout_secs: u64,
     auto_reconnect: bool,
     single_active_device: bool,
+    allowed_devices: Vec<String>,
     bluetooth_mode: Option<String>,
     call_audio_enabled: Option<bool>,
     wireplumber_fragment_name: Option<String>,
@@ -39,6 +42,7 @@ impl Default for RawOratorsConfig {
             pairing_timeout_secs: defaults.pairing_timeout_secs,
             auto_reconnect: defaults.auto_reconnect,
             single_active_device: defaults.single_active_device,
+            allowed_devices: defaults.allowed_devices,
             bluetooth_mode: None,
             call_audio_enabled: None,
             wireplumber_fragment_name: None,
@@ -60,6 +64,7 @@ impl<'de> Deserialize<'de> for OratorsConfig {
             pairing_timeout_secs: raw.pairing_timeout_secs,
             auto_reconnect: raw.auto_reconnect,
             single_active_device: raw.single_active_device,
+            allowed_devices: normalize_allowed_devices(raw.allowed_devices),
         })
     }
 }
@@ -94,6 +99,42 @@ impl OratorsConfig {
 
         Ok(())
     }
+
+    pub fn allows_device(&self, address: &str) -> bool {
+        let normalized = normalize_device_address(address);
+        self.allowed_devices.iter().any(|item| item == &normalized)
+    }
+
+    pub fn allow_device(&mut self, address: &str) -> bool {
+        let normalized = normalize_device_address(address);
+        if self.allowed_devices.iter().any(|item| item == &normalized) {
+            return false;
+        }
+        self.allowed_devices.push(normalized);
+        self.allowed_devices.sort();
+        true
+    }
+
+    pub fn disallow_device(&mut self, address: &str) -> bool {
+        let normalized = normalize_device_address(address);
+        let original_len = self.allowed_devices.len();
+        self.allowed_devices.retain(|item| item != &normalized);
+        original_len != self.allowed_devices.len()
+    }
+}
+
+pub fn normalize_device_address(address: &str) -> String {
+    address.trim().replace('-', ":").to_ascii_uppercase()
+}
+
+fn normalize_allowed_devices(devices: Vec<String>) -> Vec<String> {
+    let mut normalized = devices
+        .into_iter()
+        .map(|device| normalize_device_address(&device))
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 #[cfg(test)]
@@ -129,10 +170,27 @@ wireplumber_fragment_name = "90-orators-bluetooth.conf"
     }
 
     #[test]
+    fn allowed_devices_are_normalized() {
+        let parsed: OratorsConfig = toml::from_str(
+            r#"
+allowed_devices = ["5c-dc-49-92-d0-d8", "5C:DC:49:92:D0:D8"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.allowed_devices,
+            vec!["5C:DC:49:92:D0:D8".to_string()]
+        );
+        assert!(parsed.allows_device("5c:dc:49:92:d0:d8"));
+    }
+
+    #[test]
     fn save_writes_only_media_safe_fields() {
         let serialized = toml::to_string_pretty(&OratorsConfig::default()).unwrap();
 
         assert!(serialized.contains("pairing_timeout_secs = 120"));
+        assert!(serialized.contains("allowed_devices = []"));
         assert!(!serialized.contains("call_audio_enabled"));
         assert!(!serialized.contains("bluetooth_mode"));
     }

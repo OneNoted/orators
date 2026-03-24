@@ -47,6 +47,10 @@ impl LinuxPlatform {
         self.bluez.trust_device(address).await
     }
 
+    pub async fn untrust_device(&self, address: &str) -> Result<()> {
+        self.bluez.untrust_device(address).await
+    }
+
     pub async fn forget_device(&self, address: &str) -> Result<()> {
         self.bluez.forget_device(address).await
     }

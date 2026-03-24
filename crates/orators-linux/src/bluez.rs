@@ -189,6 +189,23 @@ impl BluetoothCtlBluez {
         Ok(())
     }
 
+    pub async fn untrust_device(&self, address: &str) -> Result<()> {
+        let device_path = self.device_path(address).await?;
+        let device = Proxy::new(
+            &self.connection,
+            BLUEZ_SERVICE,
+            device_path.clone(),
+            "org.bluez.Device1",
+        )
+        .await
+        .with_context(|| format!("failed to create BlueZ device proxy for {address}"))?;
+        device
+            .set_property("Trusted", false)
+            .await
+            .with_context(|| format!("failed to untrust device {address}"))?;
+        Ok(())
+    }
+
     pub async fn forget_device(&self, address: &str) -> Result<()> {
         let adapter_path = self.adapter_path().await?;
         let device_path = self.device_path(address).await?;

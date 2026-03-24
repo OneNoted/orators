@@ -13,6 +13,7 @@ pub trait PlatformRuntime: Send + Sync {
     async fn start_pairing(&self, timeout_secs: u64) -> Result<()>;
     async fn stop_pairing(&self) -> Result<()>;
     async fn trust_device(&self, address: &str) -> Result<()>;
+    async fn untrust_device(&self, address: &str) -> Result<()>;
     async fn forget_device(&self, address: &str) -> Result<()>;
     async fn connect_device(&self, address: &str) -> Result<()>;
     async fn disconnect_device(&self, address: &str) -> Result<()>;
@@ -39,6 +40,10 @@ impl PlatformRuntime for orators_linux::LinuxPlatform {
 
     async fn trust_device(&self, address: &str) -> Result<()> {
         self.trust_device(address).await
+    }
+
+    async fn untrust_device(&self, address: &str) -> Result<()> {
+        self.untrust_device(address).await
     }
 
     async fn forget_device(&self, address: &str) -> Result<()> {
@@ -169,6 +174,16 @@ impl<R: PlatformRuntime> OratorsService<R> {
         serialize(&state.status(now))
     }
 
+    pub async fn untrust_device(&self, address: &str) -> Result<String> {
+        self.refresh_status().await?;
+        self.runtime.untrust_device(address).await?;
+
+        let now = now_epoch_secs();
+        let mut state = self.state.lock().await;
+        state.untrust_device(address)?;
+        serialize(&state.status(now))
+    }
+
     pub async fn connect_device(&self, address: &str) -> Result<String> {
         self.runtime.ensure_host_media_ready().await?;
         self.refresh_status().await?;
@@ -237,12 +252,36 @@ impl<R: PlatformRuntime> OratorsService<R> {
 
     async fn refresh_status(&self) -> Result<orators_core::RuntimeStatus> {
         let devices = self.runtime.list_devices().await?;
+        let devices = self.apply_allowlist_if_needed(devices).await?;
         let audio = self.runtime.current_audio_defaults().await?;
         let now = now_epoch_secs();
         let mut state = self.state.lock().await;
         state.sync_devices(devices);
         state.update_audio(audio);
         Ok(state.status(now))
+    }
+
+    async fn apply_allowlist_if_needed(&self, devices: Vec<DeviceInfo>) -> Result<Vec<DeviceInfo>> {
+        let allowlisted = devices
+            .iter()
+            .filter(|device| {
+                device.paired && !device.trusted && self.config.allows_device(&device.address)
+            })
+            .map(|device| device.address.clone())
+            .collect::<Vec<_>>();
+
+        if allowlisted.is_empty() {
+            return Ok(devices);
+        }
+
+        for address in &allowlisted {
+            self.runtime
+                .trust_device(address)
+                .await
+                .with_context(|| format!("failed to trust allowlisted device {address}"))?;
+        }
+
+        self.runtime.list_devices().await
     }
 
     fn default_timeout(&self) -> u64 {
@@ -313,6 +352,19 @@ mod tests {
                 .find(|device| device.address == address)
             {
                 device.trusted = true;
+            }
+            Ok(())
+        }
+
+        async fn untrust_device(&self, address: &str) -> Result<()> {
+            if let Some(device) = self
+                .devices
+                .lock()
+                .await
+                .iter_mut()
+                .find(|device| device.address == address)
+            {
+                device.trusted = false;
             }
             Ok(())
         }
@@ -431,5 +483,19 @@ mod tests {
 
         assert_eq!(expired.active_device.as_deref(), Some("AA"));
         assert_eq!(*runtime.stop_pairing_calls.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn allowlisted_paired_devices_are_auto_trusted() {
+        let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
+        let mut config = OratorsConfig::default();
+        config.allow_device("AA");
+        let service = OratorsService::new(runtime, config);
+
+        let status = service.status_json().await.unwrap();
+        let status: orators_core::RuntimeStatus = serde_json::from_str(&status).unwrap();
+
+        assert!(status.devices[0].trusted);
+        assert!(status.devices[0].auto_reconnect);
     }
 }

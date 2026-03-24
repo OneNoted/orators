@@ -3,7 +3,8 @@ use std::{env, path::PathBuf};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use orators_core::{
-    BluetoothProfile, DiagnosticCheck, DiagnosticsReport, RuntimeStatus, Severity, dbus,
+    BluetoothProfile, DiagnosticCheck, DiagnosticsReport, OratorsConfig, RuntimeStatus, Severity,
+    dbus, normalize_device_address,
 };
 use orators_linux::systemd::SystemdUserRuntime;
 use serde_json::Value;
@@ -56,6 +57,8 @@ pub struct DeviceArgs {
 #[derive(Debug, Subcommand)]
 pub enum DeviceCommand {
     List,
+    Allow { mac: String },
+    Disallow { mac: String },
     Trust { mac: String },
     Forget { mac: String },
 }
@@ -114,6 +117,18 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
                     render_devices(&devices);
                 }
             }
+            DeviceCommand::Allow { mac } => {
+                let mac = normalize_device_address(&mac);
+                update_allowlist(&mac, true)?;
+                let output = client.trust_device(&mac).await?;
+                render_status_output(output, json, "Device added to allowlist.")?;
+            }
+            DeviceCommand::Disallow { mac } => {
+                let mac = normalize_device_address(&mac);
+                update_allowlist(&mac, false)?;
+                let output = client.untrust_device(&mac).await?;
+                render_status_output(output, json, "Device removed from allowlist.")?;
+            }
             DeviceCommand::Trust { mac } => {
                 let output = client.trust_device(&mac).await?;
                 render_status_output(output, json, "Device trusted.")?;
@@ -171,6 +186,18 @@ fn resolve_daemon_path() -> Result<PathBuf> {
         .context("current executable has no parent directory")?
         .join("oratorsd");
     Ok(daemon_path)
+}
+
+fn update_allowlist(address: &str, allow: bool) -> Result<()> {
+    let config_path = default_config_path()?;
+    let mut config = OratorsConfig::load_or_default(&config_path)?;
+    if allow {
+        config.allow_device(address);
+    } else {
+        config.disallow_device(address);
+    }
+    config.save(&config_path)?;
+    Ok(())
 }
 
 fn print_jsonish(value: &str) -> Result<()> {
@@ -431,6 +458,14 @@ impl ControllerClient {
             .call("TrustDevice", &(address,))
             .await
             .map_err(|error| explain_dbus_error("trust device", error))
+    }
+
+    async fn untrust_device(&self, address: &str) -> Result<String> {
+        self.proxy()
+            .await?
+            .call("UntrustDevice", &(address,))
+            .await
+            .map_err(|error| explain_dbus_error("untrust device", error))
     }
 
     async fn forget_device(&self, address: &str) -> Result<String> {
