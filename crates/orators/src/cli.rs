@@ -3,14 +3,11 @@ use std::{env, path::PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use orators_core::dbus;
-use orators_linux::LinuxPlatform;
+use orators_linux::{systemd::SystemdUserRuntime, wireplumber::WirePlumberRuntime};
 use serde_json::Value;
 use zbus::{Connection, Proxy};
 
-use crate::{
-    daemon::{RuntimePaths, default_config_path, ensure_config_exists},
-    service::OratorsService,
-};
+use crate::daemon::{RuntimePaths, default_config_path, ensure_config_exists};
 
 #[derive(Debug, Parser)]
 #[command(name = "oratorsctl", about = "Control the Orators daemon")]
@@ -110,15 +107,15 @@ async fn install_user_service() -> Result<()> {
     let config_path = default_config_path()?;
     let config = ensure_config_exists(&config_path)?;
     let paths = RuntimePaths::discover(config_path.clone(), &config)?;
-    let platform = LinuxPlatform::new(paths.fragment_path, config.clone());
-    let service = OratorsService::new(std::sync::Arc::new(platform), config);
-
     let daemon_path = resolve_daemon_path()?;
-    let config_report = service.apply_session_config().await?;
-    let unit_path = service.install_user_service(&daemon_path).await?;
+    let wireplumber = WirePlumberRuntime;
+    let systemd = SystemdUserRuntime;
 
-    print_jsonish(&config_report)?;
-    println!("{unit_path}");
+    let config_report = wireplumber.ensure_fragment(&paths.fragment_path).await?;
+    let unit_path = systemd.install_user_service(&daemon_path).await?;
+
+    println!("{}", serde_json::to_string_pretty(&config_report)?);
+    println!("{}", unit_path.display());
     Ok(())
 }
 

@@ -24,7 +24,7 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
     let paths = RuntimePaths::discover(config_path, &config)?;
     tokio::fs::create_dir_all(&paths.state_dir).await?;
 
-    let runtime = Arc::new(LinuxPlatform::new(paths.fragment_path, config.clone()));
+    let runtime = Arc::new(LinuxPlatform::new(paths.fragment_path, config.clone()).await?);
     runtime.apply_session_config().await?;
     let service = Arc::new(OratorsService::new(runtime, config));
 

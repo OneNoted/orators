@@ -29,15 +29,15 @@ pub struct LinuxPlatform {
 }
 
 impl LinuxPlatform {
-    pub fn new(fragment_path: PathBuf, config: OratorsConfig) -> Self {
-        Self {
-            bluez: BluetoothCtlBluez,
+    pub async fn new(fragment_path: PathBuf, config: OratorsConfig) -> Result<Self> {
+        Ok(Self {
+            bluez: BluetoothCtlBluez::new().await?,
             audio: WpctlAudioRuntime,
             wireplumber: WirePlumberRuntime,
             systemd: SystemdUserRuntime,
             fragment_path,
             config,
-        }
+        })
     }
 
     pub async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
