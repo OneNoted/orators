@@ -73,8 +73,9 @@ To switch modes:
 
 1. Edit `bluetooth_mode` in `~/.config/orators/config.toml`
 2. Run `oratorsctl doctor --apply`
-3. Restart `oratorsd`
-4. Reconnect or re-pair the phone if the visible Bluetooth services changed
+3. Disconnect any active Bluetooth devices
+4. Restart `wireplumber.service` and `oratorsd.service`
+5. Reconnect or re-pair the phone if the visible Bluetooth services changed
 
 Legacy config values still load:
 

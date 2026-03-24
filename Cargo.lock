@@ -785,6 +785,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "orators-core",
+ "tempfile",
  "tokio",
  "tracing",
  "zbus",

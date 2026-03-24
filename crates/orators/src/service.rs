@@ -323,6 +323,8 @@ mod tests {
             Ok(SessionConfigStatus {
                 path: "/tmp/test.conf".to_string(),
                 changed: false,
+                restart_required: false,
+                restart_hint: None,
             })
         }
 

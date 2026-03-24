@@ -16,7 +16,7 @@ use crate::{
     bluez::BluetoothCtlBluez,
     diagnostics::collect_report,
     systemd::SystemdUserRuntime,
-    wireplumber::{WirePlumberRoles, WirePlumberRuntime},
+    wireplumber::{WirePlumberRoles, WirePlumberRuntime, generic_restart_hint},
 };
 
 pub struct LinuxPlatform {
@@ -89,12 +89,18 @@ impl LinuxPlatform {
     }
 
     pub async fn apply_session_config(&self) -> Result<SessionConfigStatus> {
-        let report = self
+        let mut report = self
             .wireplumber
             .ensure_fragment(&self.fragment_path, &self.config)
             .await?;
         if report.changed {
-            let _ = self.systemd.try_restart("wireplumber.service").await;
+            report.restart_required = true;
+            report.restart_hint = Some(restart_hint_for_devices(
+                self.bluez
+                    .list_devices(self.config.auto_reconnect)
+                    .await
+                    .ok(),
+            ));
         }
         Ok(report)
     }
@@ -124,4 +130,66 @@ pub fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn restart_hint_for_devices(devices: Option<Vec<DeviceInfo>>) -> String {
+    let Some(devices) = devices else {
+        return format!(
+            "{} BlueZ could not be queried, so verify Bluetooth is idle before restarting user services.",
+            generic_restart_hint()
+        );
+    };
+
+    let connected_devices = devices
+        .into_iter()
+        .filter(|device| device.connected)
+        .map(|device| device.alias.unwrap_or(device.address))
+        .collect::<Vec<_>>();
+
+    if connected_devices.is_empty() {
+        return generic_restart_hint();
+    }
+
+    format!(
+        "WirePlumber was not restarted automatically because connected Bluetooth devices were detected: {}. Disconnect them first, then run `systemctl --user restart wireplumber.service oratorsd.service`.",
+        connected_devices.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use orators_core::DeviceInfo;
+
+    use super::restart_hint_for_devices;
+
+    fn device(address: &str, alias: Option<&str>, connected: bool) -> DeviceInfo {
+        DeviceInfo {
+            address: address.to_string(),
+            alias: alias.map(str::to_string),
+            trusted: false,
+            paired: false,
+            connected,
+            active_profile: None,
+            auto_reconnect: false,
+        }
+    }
+
+    #[test]
+    fn restart_hint_warns_about_connected_devices() {
+        let hint = restart_hint_for_devices(Some(vec![
+            device("AA", Some("Phone"), true),
+            device("BB", None, false),
+        ]));
+
+        assert!(hint.contains("Phone"));
+        assert!(hint.contains("Disconnect them first"));
+    }
+
+    #[test]
+    fn restart_hint_falls_back_when_no_devices_connected() {
+        let hint = restart_hint_for_devices(Some(vec![device("AA", Some("Phone"), false)]));
+
+        assert!(hint.contains("WirePlumber was not restarted automatically"));
+        assert!(!hint.contains("Disconnect them first"));
+    }
 }

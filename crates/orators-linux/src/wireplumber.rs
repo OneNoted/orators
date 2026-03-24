@@ -37,6 +37,8 @@ impl WirePlumberRuntime {
         Ok(SessionConfigStatus {
             path: path.display().to_string(),
             changed,
+            restart_required: changed,
+            restart_hint: changed.then_some(generic_restart_hint()),
         })
     }
 
@@ -51,6 +53,8 @@ impl WirePlumberRuntime {
         Ok(SessionConfigStatus {
             path: path.display().to_string(),
             changed: current != render_fragment(config),
+            restart_required: false,
+            restart_hint: None,
         })
     }
 
@@ -136,11 +140,16 @@ fn bool_literal(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
+pub fn generic_restart_hint() -> String {
+    "WirePlumber was not restarted automatically. Run `systemctl --user restart wireplumber.service oratorsd.service` after Bluetooth is idle to apply the new policy.".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use orators_core::{BluetoothMode, OratorsConfig};
+    use tempfile::tempdir;
 
-    use super::{parse_roles, render_fragment};
+    use super::{WirePlumberRuntime, generic_restart_hint, parse_roles, render_fragment};
 
     #[test]
     fn default_fragment_is_media_first() {
@@ -195,5 +204,24 @@ mod tests {
         assert_eq!(roles.autoswitch_to_headset_profile, Some(false));
         assert!(fragment.contains("bap_sink"));
         assert!(fragment.contains("bap_source"));
+    }
+
+    #[tokio::test]
+    async fn ensure_fragment_reports_manual_restart_requirement_when_changed() {
+        let runtime = WirePlumberRuntime;
+        let tempdir = tempdir().unwrap();
+        let path = tempdir.path().join("90-orators-bluetooth.conf");
+
+        let report = runtime
+            .ensure_fragment(&path, &OratorsConfig::default())
+            .await
+            .unwrap();
+
+        assert!(report.changed);
+        assert!(report.restart_required);
+        assert_eq!(
+            report.restart_hint.as_deref(),
+            Some(generic_restart_hint().as_str())
+        );
     }
 }

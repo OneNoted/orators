@@ -138,6 +138,8 @@ impl OratorsConfig {
         Ok(SessionConfigStatus {
             path: path.display().to_string(),
             changed: true,
+            restart_required: false,
+            restart_hint: None,
         })
     }
 }

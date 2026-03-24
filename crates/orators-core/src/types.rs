@@ -46,4 +46,8 @@ pub struct RuntimeStatus {
 pub struct SessionConfigStatus {
     pub path: String,
     pub changed: bool,
+    #[serde(default)]
+    pub restart_required: bool,
+    #[serde(default)]
+    pub restart_hint: Option<String>,
 }

@@ -13,3 +13,6 @@ orators-core = { path = "../orators-core" }
 tokio.workspace = true
 tracing.workspace = true
 zbus.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

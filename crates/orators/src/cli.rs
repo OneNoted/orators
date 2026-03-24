@@ -150,15 +150,7 @@ async fn run_doctor(args: DoctorArgs, json: bool) -> Result<()> {
             print_jsonish(&applied)?;
         } else {
             let report: orators_core::SessionConfigStatus = serde_json::from_str(&applied)?;
-            println!(
-                "WirePlumber config {} at {}.",
-                if report.changed {
-                    "updated"
-                } else {
-                    "already matched"
-                },
-                report.path
-            );
+            render_session_config_report(&report);
         }
     }
 
@@ -198,6 +190,9 @@ async fn install_user_service(json: bool) -> Result<()> {
             },
             config_report.path
         );
+        if let Some(restart_hint) = &config_report.restart_hint {
+            println!("Next step: {restart_hint}");
+        }
         println!("Installed user service at {}.", unit_path.display());
     }
     Ok(())
@@ -218,6 +213,22 @@ fn print_jsonish(value: &str) -> Result<()> {
         Err(_) => println!("{value}"),
     }
     Ok(())
+}
+
+fn render_session_config_report(report: &orators_core::SessionConfigStatus) {
+    println!(
+        "WirePlumber config {} at {}.",
+        if report.changed {
+            "updated"
+        } else {
+            "already matched"
+        },
+        report.path
+    );
+
+    if let Some(restart_hint) = &report.restart_hint {
+        println!("Next step: {restart_hint}");
+    }
 }
 
 fn render_status_output(output: String, json: bool, prefix: &str) -> Result<()> {
