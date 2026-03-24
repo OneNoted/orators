@@ -7,7 +7,7 @@ use orators_core::{
 };
 use orators_linux::systemd::SystemdUserRuntime;
 use serde_json::Value;
-use zbus::{Connection, Proxy};
+use zbus::{Connection, Proxy, fdo::DBusProxy, names::BusName};
 
 use crate::daemon::{default_config_path, ensure_config_exists};
 
@@ -386,11 +386,11 @@ struct ControllerClient {
 
 impl ControllerClient {
     async fn connect() -> Result<Self> {
-        Ok(Self {
-            connection: Connection::session()
-                .await
-                .context("failed to connect to session bus")?,
-        })
+        let connection = Connection::session()
+            .await
+            .context("failed to connect to session bus")?;
+        ensure_daemon_running(&connection).await?;
+        Ok(Self { connection })
     }
 
     async fn status(&self) -> Result<String> {
@@ -475,6 +475,38 @@ impl ControllerClient {
         .await
         .context("failed to connect to Orators D-Bus interface")
     }
+}
+
+async fn ensure_daemon_running(connection: &Connection) -> Result<()> {
+    let bus_name = BusName::try_from(dbus::BUS_NAME).context("invalid Orators D-Bus bus name")?;
+    let bus = DBusProxy::new(connection)
+        .await
+        .context("failed to connect to session D-Bus daemon")?;
+    if bus
+        .name_has_owner(bus_name.clone())
+        .await
+        .context("failed to query Orators D-Bus ownership")?
+    {
+        return Ok(());
+    }
+
+    SystemdUserRuntime
+        .start_orators_service()
+        .await
+        .context("failed to start oratorsd.service; run `oratorsctl install-user-service` first")?;
+
+    for _ in 0..12 {
+        if bus
+            .name_has_owner(bus_name.clone())
+            .await
+            .context("failed to re-check Orators D-Bus ownership")?
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    anyhow::bail!("oratorsd.service started, but the D-Bus control interface never appeared")
 }
 
 fn explain_dbus_error(action: &str, error: zbus::Error) -> anyhow::Error {

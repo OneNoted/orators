@@ -25,9 +25,12 @@ impl SystemdUserRuntime {
 
         fs::write(&unit_path, render_unit(daemon_path)).await?;
         self.run_systemctl(["daemon-reload"]).await?;
-        self.run_systemctl(["enable", "--now", UNIT_NAME]).await?;
 
         Ok(unit_path)
+    }
+
+    pub async fn start_orators_service(&self) -> Result<()> {
+        self.run_systemctl(["start", UNIT_NAME]).await
     }
 
     pub async fn try_restart(&self, unit_name: &str) -> Result<()> {
