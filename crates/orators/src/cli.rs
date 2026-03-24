@@ -328,7 +328,7 @@ fn render_audio_summary(status: &RuntimeStatus) {
             .unwrap_or("not detected")
     );
     println!(
-        "Bluetooth roles: a2dp_sink={}, hfp_hf={}",
+        "Bluetooth roles: a2dp_sink={}, headset_call={}",
         yes_no(status.audio.a2dp_sink_enabled),
         yes_no(status.audio.hfp_hf_enabled),
     );

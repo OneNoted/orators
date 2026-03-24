@@ -86,7 +86,7 @@ pub async fn collect_report(
             severity: Severity::Info,
             summary: "Bluetooth media and hands-free call support are enabled".to_string(),
             detail: Some(
-                "Orators will prefer A2DP for normal playback and expose the hands-free HFP role when a voice app opens the microphone. Call sessions will use lower-fidelity HFP audio by design."
+                "Orators will prefer A2DP for normal playback and expose headset-side HSP/HFP roles when a voice app opens the microphone. Call sessions will use lower-fidelity headset audio by design."
                     .to_string(),
             ),
             remediation: None,
@@ -170,7 +170,7 @@ pub async fn collect_report(
 
 fn expected_roles_label(call_audio_enabled: bool) -> &'static str {
     if call_audio_enabled {
-        "a2dp_sink, hfp_hf"
+        "a2dp_sink, hsp_hs, hfp_hf"
     } else {
         "a2dp_sink"
     }

@@ -62,7 +62,7 @@ impl WirePlumberRuntime {
 
 pub fn render_fragment(config: &OratorsConfig) -> String {
     let roles = if config.call_audio_enabled {
-        "a2dp_sink hfp_hf"
+        "a2dp_sink hsp_hs hfp_hf"
     } else {
         "a2dp_sink"
     };
@@ -107,7 +107,7 @@ monitor.bluez.rules = [
 pub fn parse_roles(contents: &str) -> WirePlumberRoles {
     WirePlumberRoles {
         a2dp_sink_enabled: contents.contains("a2dp_sink"),
-        hfp_hf_enabled: contents.contains("hfp_hf"),
+        hfp_hf_enabled: contents.contains("hfp_hf") || contents.contains("hsp_hs"),
     }
 }
 
@@ -136,6 +136,7 @@ mod tests {
         assert!(roles.hfp_hf_enabled);
         assert!(fragment.contains("device.profile = \"a2dp-sink\""));
         assert!(fragment.contains("bluez5.auto-connect = [ a2dp_sink ]"));
+        assert!(fragment.contains("hsp_hs"));
     }
 
     #[test]
