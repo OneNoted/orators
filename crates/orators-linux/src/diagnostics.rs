@@ -15,6 +15,13 @@ use crate::{
 const TMAP_UUID: &str = "00001855-0000-1000-8000-00805f9b34fb";
 const LOCAL_LE_AUDIO_MARKER_ROOTS: &[&str] = &["/usr/share/wireplumber", "/usr/share/pipewire"];
 
+#[derive(Debug, Clone)]
+struct LeAudioSupport {
+    local_capable: bool,
+    remote_capable: bool,
+    remote_device_label: Option<String>,
+}
+
 pub async fn collect_report(
     bluez: &BluetoothCtlBluez,
     audio: &WpctlAudioRuntime,
@@ -128,12 +135,23 @@ pub async fn collect_report(
         remote_devices.as_deref(),
     ));
 
+    let le_audio_support = assess_le_audio_support(
+        adapter_info.as_ref(),
+        roles.as_ref(),
+        remote_devices.as_deref(),
+    );
+    checks.push(call_experience_check(
+        config.bluetooth_mode,
+        &le_audio_support,
+    ));
+
     let defaults = audio
         .current_defaults(
             roles.as_ref().is_some_and(|roles| roles.a2dp_sink_enabled),
             roles
                 .as_ref()
                 .is_some_and(|roles| roles.classic_call_enabled),
+            roles.as_ref().is_some_and(|roles| roles.le_audio_enabled),
         )
         .await;
     checks.push(match defaults {
@@ -185,13 +203,13 @@ fn mode_check(mode: BluetoothMode) -> DiagnosticCheck {
             "Bluetooth mode is classic_media",
             "Speaker-first mode. Orators exposes A2DP playback only and disables headset autoswitch so media stays in the high-quality speaker path.",
         ),
-        BluetoothMode::ClassicCall => (
-            "Bluetooth mode is classic_call",
-            "Classic Bluetooth call mode. Orators still prefers A2DP first, but it also exposes headset-side HSP/HFP roles and allows headset autoswitch for bidirectional call audio.",
+        BluetoothMode::ClassicCallCompat => (
+            "Bluetooth mode is classic_call_compat",
+            "Classic Bluetooth compatibility-call mode. Orators still prefers A2DP first, but it also exposes headset-side HSP/HFP roles and allows headset autoswitch for bidirectional call audio with a quality tradeoff.",
         ),
-        BluetoothMode::ExperimentalLeAudio => (
-            "Bluetooth mode is experimental_le_audio",
-            "Experimental LE Audio/BAP mode. Orators keeps A2DP fallback enabled, but LE Audio availability depends on the local Linux stack and the remote device advertising compatible services.",
+        BluetoothMode::LeAudioCall => (
+            "Bluetooth mode is le_audio_call",
+            "LE Audio call mode. Orators requests BAP roles for newer Bluetooth stacks and keeps A2DP fallback enabled for media, but premium call behavior depends on both the Linux host and the remote device advertising LE Audio capability.",
         ),
     };
 
@@ -212,8 +230,8 @@ fn policy_check(
     match roles {
         Some(roles)
             if roles.a2dp_sink_enabled
-                && roles.classic_call_enabled == mode.classic_call_enabled()
-                && roles.le_audio_enabled == mode.le_audio_enabled() =>
+                && roles.classic_call_enabled == mode.classic_call_compat_enabled()
+                && roles.le_audio_enabled == mode.le_audio_call_enabled() =>
         {
             DiagnosticCheck {
                 code: "bluetooth.policy".to_string(),
@@ -347,14 +365,14 @@ fn le_audio_local_check(
     } else {
         DiagnosticCheck {
             code: "bluetooth.le_audio.local".to_string(),
-            severity: if mode.le_audio_enabled() {
+            severity: if mode.le_audio_call_enabled() {
                 Severity::Warn
             } else {
                 Severity::Info
             },
             summary: "Local LE Audio/BAP capability could not be confirmed".to_string(),
             detail: Some(detail),
-            remediation: mode.le_audio_enabled().then_some(
+            remediation: mode.le_audio_call_enabled().then_some(
                 "Stay on `classic_media` unless the host stack is upgraded to a PipeWire/WirePlumber/BlueZ combination that clearly exposes LE Audio roles."
                     .to_string(),
             ),
@@ -396,7 +414,7 @@ fn le_audio_remote_check(
     } else {
         DiagnosticCheck {
             code: "bluetooth.le_audio.remote".to_string(),
-            severity: if mode.le_audio_enabled() {
+            severity: if mode.le_audio_call_enabled() {
                 Severity::Warn
             } else {
                 Severity::Info
@@ -408,11 +426,103 @@ fn le_audio_remote_check(
                 device.alias.as_deref().unwrap_or("unnamed"),
                 device.address
             )),
-            remediation: mode.le_audio_enabled().then_some(
+            remediation: mode.le_audio_call_enabled().then_some(
                 "Re-pair with a phone that advertises LE Audio services, or fall back to `classic_media`."
                     .to_string(),
             ),
         }
+    }
+}
+
+fn call_experience_check(mode: BluetoothMode, support: &LeAudioSupport) -> DiagnosticCheck {
+    match mode {
+        BluetoothMode::ClassicMedia => DiagnosticCheck {
+            code: "bluetooth.call_experience".to_string(),
+            severity: Severity::Info,
+            summary: "Bluetooth calls are intentionally disabled in speaker-first mode".to_string(),
+            detail: Some(
+                "This mode keeps the device on the high-quality A2DP speaker path. Discord and other call apps should stay on the phone unless you explicitly opt into another mode."
+                    .to_string(),
+            ),
+            remediation: None,
+        },
+        BluetoothMode::ClassicCallCompat => DiagnosticCheck {
+            code: "bluetooth.call_experience".to_string(),
+            severity: Severity::Warn,
+            summary: "Classic Bluetooth calls are compatibility-only".to_string(),
+            detail: Some(
+                "This mode exposes HSP/HFP so calls can work on older devices, but quality will drop when the microphone is active."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "Use `bluetooth_mode = \"le_audio_call\"` only on devices that advertise LE Audio support if you want the premium call path."
+                    .to_string(),
+            ),
+        },
+        BluetoothMode::LeAudioCall if support.local_capable && support.remote_capable => {
+            DiagnosticCheck {
+                code: "bluetooth.call_experience".to_string(),
+                severity: Severity::Info,
+                summary: "Premium LE Audio call path is eligible on the current device pair"
+                    .to_string(),
+                detail: Some(format!(
+                    "The local Linux stack exposes LE Audio hints and {} advertises LE Audio-related services. This is the only mode where Orators treats Bluetooth calls as first-class.",
+                    support
+                        .remote_device_label
+                        .as_deref()
+                        .unwrap_or("the remote device")
+                )),
+                remediation: None,
+            }
+        }
+        BluetoothMode::LeAudioCall => DiagnosticCheck {
+            code: "bluetooth.call_experience".to_string(),
+            severity: Severity::Warn,
+            summary: "Premium LE Audio calls are not yet eligible on the current device pair"
+                .to_string(),
+            detail: Some(format!(
+                "Local LE Audio capable: {}. Remote LE Audio capable: {}. {}",
+                yes_no(support.local_capable),
+                yes_no(support.remote_capable),
+                support
+                    .remote_device_label
+                    .as_deref()
+                    .map(|label| format!("{label} does not currently qualify for the premium call path."))
+                    .unwrap_or_else(|| "No paired phone currently qualifies for the premium call path.".to_string())
+            )),
+            remediation: Some(
+                "Keep using `classic_media` for speaker use, or switch to `classic_call_compat` only if you explicitly want the lower-quality compatibility call path."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn assess_le_audio_support(
+    adapter_info: Option<&AdapterInfo>,
+    roles: Option<&WirePlumberRoles>,
+    remote_devices: Option<&[RemoteDeviceInfo]>,
+) -> LeAudioSupport {
+    let local_marker_paths = detect_local_bap_role_markers();
+    let local_capable = roles.is_some_and(|roles| roles.le_audio_enabled)
+        && (!local_marker_paths.is_empty()
+            || adapter_info.is_some_and(|adapter| {
+                adapter.uuids.iter().any(|uuid| is_le_audio_hint_uuid(uuid))
+            }));
+    let remote = remote_devices.and_then(select_remote_device_for_diagnostics);
+    let remote_capable =
+        remote.is_some_and(|device| device.uuids.iter().any(|uuid| is_le_audio_hint_uuid(uuid)));
+
+    LeAudioSupport {
+        local_capable,
+        remote_capable,
+        remote_device_label: remote.map(|device| {
+            format!(
+                "{} [{}]",
+                device.alias.as_deref().unwrap_or("unnamed"),
+                device.address
+            )
+        }),
     }
 }
 
@@ -472,8 +582,8 @@ fn is_le_audio_hint_uuid(uuid: &str) -> bool {
 fn expected_roles_label(mode: BluetoothMode) -> &'static str {
     match mode {
         BluetoothMode::ClassicMedia => "a2dp_sink",
-        BluetoothMode::ClassicCall => "a2dp_sink, hsp_hs, hfp_hf",
-        BluetoothMode::ExperimentalLeAudio => "a2dp_sink, bap_sink, bap_source",
+        BluetoothMode::ClassicCallCompat => "a2dp_sink, hsp_hs, hfp_hf",
+        BluetoothMode::LeAudioCall => "a2dp_sink, bap_sink, bap_source",
     }
 }
 
@@ -483,10 +593,10 @@ fn observed_roles_label(roles: &WirePlumberRoles) -> String {
         labels.push("a2dp_sink");
     }
     if roles.classic_call_enabled {
-        labels.push("classic_call");
+        labels.push("classic_call_compat");
     }
     if roles.le_audio_enabled {
-        labels.push("le_audio_bap");
+        labels.push("le_audio_call");
     }
 
     if labels.is_empty() {

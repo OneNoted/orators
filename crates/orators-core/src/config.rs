@@ -12,29 +12,31 @@ use crate::{
 pub enum BluetoothMode {
     #[default]
     ClassicMedia,
-    ClassicCall,
-    ExperimentalLeAudio,
+    #[serde(alias = "classic_call")]
+    ClassicCallCompat,
+    #[serde(alias = "experimental_le_audio")]
+    LeAudioCall,
 }
 
 impl BluetoothMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::ClassicMedia => "classic_media",
-            Self::ClassicCall => "classic_call",
-            Self::ExperimentalLeAudio => "experimental_le_audio",
+            Self::ClassicCallCompat => "classic_call_compat",
+            Self::LeAudioCall => "le_audio_call",
         }
     }
 
-    pub fn classic_call_enabled(self) -> bool {
-        matches!(self, Self::ClassicCall)
+    pub fn classic_call_compat_enabled(self) -> bool {
+        matches!(self, Self::ClassicCallCompat)
     }
 
-    pub fn le_audio_enabled(self) -> bool {
-        matches!(self, Self::ExperimentalLeAudio)
+    pub fn le_audio_call_enabled(self) -> bool {
+        matches!(self, Self::LeAudioCall)
     }
 
     pub fn headset_autoswitch_enabled(self) -> bool {
-        matches!(self, Self::ClassicCall)
+        matches!(self, Self::ClassicCallCompat)
     }
 }
 
@@ -91,7 +93,7 @@ impl<'de> Deserialize<'de> for OratorsConfig {
     {
         let raw = RawOratorsConfig::deserialize(deserializer)?;
         let bluetooth_mode = raw.bluetooth_mode.unwrap_or(match raw.call_audio_enabled {
-            Some(true) => BluetoothMode::ClassicCall,
+            Some(true) => BluetoothMode::ClassicCallCompat,
             Some(false) | None => BluetoothMode::ClassicMedia,
         });
 
@@ -169,20 +171,32 @@ call_audio_enabled = true
         )
         .unwrap();
 
-        assert_eq!(parsed.bluetooth_mode, BluetoothMode::ClassicCall);
+        assert_eq!(parsed.bluetooth_mode, BluetoothMode::ClassicCallCompat);
     }
 
     #[test]
     fn explicit_bluetooth_mode_wins_over_legacy_flag() {
         let parsed: OratorsConfig = toml::from_str(
             r#"
-bluetooth_mode = "experimental_le_audio"
+bluetooth_mode = "le_audio_call"
 call_audio_enabled = false
 "#,
         )
         .unwrap();
 
-        assert_eq!(parsed.bluetooth_mode, BluetoothMode::ExperimentalLeAudio);
+        assert_eq!(parsed.bluetooth_mode, BluetoothMode::LeAudioCall);
+    }
+
+    #[test]
+    fn legacy_experimental_le_audio_value_maps_to_new_mode() {
+        let parsed: OratorsConfig = toml::from_str(
+            r#"
+bluetooth_mode = "experimental_le_audio"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.bluetooth_mode, BluetoothMode::LeAudioCall);
     }
 
     #[test]

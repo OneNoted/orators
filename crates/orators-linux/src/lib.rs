@@ -80,7 +80,11 @@ impl LinuxPlatform {
                 autoswitch_to_headset_profile: None,
             });
         self.audio
-            .current_defaults(roles.a2dp_sink_enabled, roles.classic_call_enabled)
+            .current_defaults(
+                roles.a2dp_sink_enabled,
+                roles.classic_call_enabled,
+                roles.le_audio_enabled,
+            )
             .await
     }
 

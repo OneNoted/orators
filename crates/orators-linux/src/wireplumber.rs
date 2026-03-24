@@ -65,8 +65,8 @@ impl WirePlumberRuntime {
 pub fn render_fragment(config: &OratorsConfig) -> String {
     let roles = match config.bluetooth_mode {
         BluetoothMode::ClassicMedia => "a2dp_sink",
-        BluetoothMode::ClassicCall => "a2dp_sink hsp_hs hfp_hf",
-        BluetoothMode::ExperimentalLeAudio => "a2dp_sink bap_sink bap_source",
+        BluetoothMode::ClassicCallCompat => "a2dp_sink hsp_hs hfp_hf",
+        BluetoothMode::LeAudioCall => "a2dp_sink bap_sink bap_source",
     };
     let mut fragment = format!(
         r#"wireplumber.settings = {{
@@ -79,7 +79,7 @@ monitor.bluez.properties = {{
         bool_literal(config.bluetooth_mode.headset_autoswitch_enabled())
     );
 
-    if config.bluetooth_mode.classic_call_enabled() {
+    if config.bluetooth_mode.classic_call_compat_enabled() {
         fragment.push_str(
             r#"  bluez5.hfphsp-backend = "native"
   bluez5.enable-msbc = true
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn classic_call_fragment_enables_hfp_without_auto_connecting_it() {
         let fragment = render_fragment(&OratorsConfig {
-            bluetooth_mode: BluetoothMode::ClassicCall,
+            bluetooth_mode: BluetoothMode::ClassicCallCompat,
             ..OratorsConfig::default()
         });
         let roles = parse_roles(&fragment);
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn experimental_le_audio_fragment_enables_bap_roles_with_a2dp_fallback() {
         let fragment = render_fragment(&OratorsConfig {
-            bluetooth_mode: BluetoothMode::ExperimentalLeAudio,
+            bluetooth_mode: BluetoothMode::LeAudioCall,
             ..OratorsConfig::default()
         });
         let roles = parse_roles(&fragment);

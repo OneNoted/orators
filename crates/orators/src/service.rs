@@ -315,6 +315,7 @@ mod tests {
                 input_device: Some("Microphone".to_string()),
                 a2dp_sink_enabled: true,
                 hfp_hf_enabled: false,
+                le_audio_call_enabled: false,
             })
         }
 

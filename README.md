@@ -37,8 +37,8 @@ nix flake check
 - `oratorsctl` talks to the daemon over the session bus
 - the daemon writes a per-user WirePlumber fragment under `~/.config/wireplumber/wireplumber.conf.d/`
 - `classic_media` is the default mode and keeps the host in speaker-style `a2dp_sink` playback with headset autoswitch disabled
-- `classic_call` is an explicit opt-in mode that also exposes headset-side `hsp_hs` / `hfp_hf` roles and allows autoswitch into lower-fidelity bidirectional call audio
-- `experimental_le_audio` requests `bap_sink` / `bap_source` while keeping A2DP fallback enabled, but it depends on the local Linux stack and the remote device advertising compatible services
+- `classic_call_compat` is an explicit opt-in compatibility mode that also exposes headset-side `hsp_hs` / `hfp_hf` roles and allows autoswitch into lower-fidelity bidirectional call audio
+- `le_audio_call` requests `bap_sink` / `bap_source` while keeping A2DP fallback enabled, and is the only mode intended for first-class Bluetooth calls on devices that advertise modern LE Audio capability
 
 ## Bluetooth Modes
 
@@ -47,15 +47,15 @@ nix flake check
 - A2DP only.
 - No Bluetooth mic/call route is exposed to the phone.
 
-- `classic_call`
+- `classic_call_compat`
 - Classic Bluetooth bidirectional call path.
 - Starts in A2DP, but WirePlumber is allowed to autoswitch into headset mode when a voice app starts recording.
 - Lower fidelity during calls is expected.
 
-- `experimental_le_audio`
-- Research mode for newer Bluetooth audio transports.
-- Requests BAP roles and keeps A2DP fallback.
-- Discovery and call behavior are not guaranteed yet on the current Linux/phone/app combination.
+- `le_audio_call`
+- Premium-call mode for newer Bluetooth stacks.
+- Requests BAP roles and keeps A2DP fallback for media.
+- Orators should only treat calls as first-class when both the Linux host and the connected phone advertise LE Audio capability.
 
 ## Configuration
 
@@ -75,3 +75,8 @@ To switch modes:
 2. Run `oratorsctl doctor --apply`
 3. Restart `oratorsd`
 4. Reconnect or re-pair the phone if the visible Bluetooth services changed
+
+Legacy config values still load:
+
+- `classic_call` maps to `classic_call_compat`
+- `experimental_le_audio` maps to `le_audio_call`

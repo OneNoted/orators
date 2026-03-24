@@ -331,9 +331,10 @@ fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&Diagnostics
             .unwrap_or("not detected")
     );
     println!(
-        "Bluetooth transports: a2dp_sink={}, classic_call={}",
+        "Bluetooth transports: a2dp_sink={}, classic_call_compat={}, le_audio_call={}",
         yes_no(status.audio.a2dp_sink_enabled),
         yes_no(status.audio.hfp_hf_enabled),
+        yes_no(status.audio.le_audio_call_enabled),
     );
     if let Some(summary) = diagnostics.and_then(audio_mode_detail) {
         println!("Bluetooth policy: {summary}");
@@ -349,6 +350,9 @@ fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&Diagnostics
     }
     if let Some(summary) = diagnostics.and_then(autoswitch_summary) {
         println!("Headset autoswitch: {summary}");
+    }
+    if let Some(summary) = diagnostics.and_then(call_experience_summary) {
+        println!("Call path: {summary}");
     }
 }
 
@@ -409,6 +413,11 @@ fn autoswitch_summary(report: &DiagnosticsReport) -> Option<&str> {
     } else {
         Some(check.summary.as_str())
     }
+}
+
+fn call_experience_summary(report: &DiagnosticsReport) -> Option<&str> {
+    let check = find_check(report, "bluetooth.call_experience")?;
+    check.detail.as_deref().or(Some(check.summary.as_str()))
 }
 
 fn severity_label(severity: &Severity) -> &'static str {
