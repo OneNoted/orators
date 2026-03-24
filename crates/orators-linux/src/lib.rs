@@ -75,10 +75,10 @@ impl LinuxPlatform {
             .await
             .unwrap_or(WirePlumberRoles {
                 a2dp_sink_enabled: false,
-                hfp_ag_enabled: false,
+                hfp_hf_enabled: false,
             });
         self.audio
-            .current_defaults(roles.a2dp_sink_enabled, roles.hfp_ag_enabled)
+            .current_defaults(roles.a2dp_sink_enabled, roles.hfp_hf_enabled)
             .await
     }
 

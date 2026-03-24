@@ -328,13 +328,13 @@ fn render_audio_summary(status: &RuntimeStatus) {
             .unwrap_or("not detected")
     );
     println!(
-        "Bluetooth roles: a2dp_sink={}, hfp_ag={}",
+        "Bluetooth roles: a2dp_sink={}, hfp_hf={}",
         yes_no(status.audio.a2dp_sink_enabled),
-        yes_no(status.audio.hfp_ag_enabled),
+        yes_no(status.audio.hfp_hf_enabled),
     );
     println!(
         "Call audio: {}",
-        if status.audio.hfp_ag_enabled {
+        if status.audio.hfp_hf_enabled {
             "available by default; media stays on A2DP until a voice app uses the microphone"
         } else {
             "disabled; Discord and other VoIP apps will not see a Bluetooth microphone path"

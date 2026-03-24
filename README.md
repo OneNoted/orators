@@ -35,7 +35,7 @@ nix flake check
 
 - `oratorsd` runs under `systemd --user`
 - `oratorsctl` talks to the daemon over the session bus
-- the daemon writes a per-user WirePlumber fragment that prefers `a2dp_sink` for media playback and can expose `hfp_ag` for Discord/VoIP call audio
+- the daemon writes a per-user WirePlumber fragment that prefers `a2dp_sink` for media playback and can expose `hfp_hf` for Discord/VoIP call audio
 
 ## Bluetooth Profiles
 

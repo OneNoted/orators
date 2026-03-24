@@ -7,7 +7,7 @@ use tokio::fs;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WirePlumberRoles {
     pub a2dp_sink_enabled: bool,
-    pub hfp_ag_enabled: bool,
+    pub hfp_hf_enabled: bool,
 }
 
 pub struct WirePlumberRuntime;
@@ -62,7 +62,7 @@ impl WirePlumberRuntime {
 
 pub fn render_fragment(config: &OratorsConfig) -> String {
     let roles = if config.call_audio_enabled {
-        "a2dp_sink hfp_ag"
+        "a2dp_sink hfp_hf"
     } else {
         "a2dp_sink"
     };
@@ -107,7 +107,7 @@ monitor.bluez.rules = [
 pub fn parse_roles(contents: &str) -> WirePlumberRoles {
     WirePlumberRoles {
         a2dp_sink_enabled: contents.contains("a2dp_sink"),
-        hfp_ag_enabled: contents.contains("hfp_ag"),
+        hfp_hf_enabled: contents.contains("hfp_hf"),
     }
 }
 
@@ -121,7 +121,7 @@ mod tests {
     fn default_fragment_enables_dynamic_call_support() {
         let roles = parse_roles(&render_fragment(&OratorsConfig::default()));
         assert!(roles.a2dp_sink_enabled);
-        assert!(roles.hfp_ag_enabled);
+        assert!(roles.hfp_hf_enabled);
     }
 
     #[test]
@@ -133,7 +133,7 @@ mod tests {
         let roles = parse_roles(&fragment);
 
         assert!(roles.a2dp_sink_enabled);
-        assert!(roles.hfp_ag_enabled);
+        assert!(roles.hfp_hf_enabled);
         assert!(fragment.contains("device.profile = \"a2dp-sink\""));
         assert!(fragment.contains("bluez5.auto-connect = [ a2dp_sink ]"));
     }
@@ -147,6 +147,6 @@ mod tests {
         let roles = parse_roles(&fragment);
 
         assert!(roles.a2dp_sink_enabled);
-        assert!(!roles.hfp_ag_enabled);
+        assert!(!roles.hfp_hf_enabled);
     }
 }

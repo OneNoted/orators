@@ -8,7 +8,7 @@ impl WpctlAudioRuntime {
     pub async fn current_defaults(
         &self,
         a2dp_sink_enabled: bool,
-        hfp_ag_enabled: bool,
+        hfp_hf_enabled: bool,
     ) -> Result<AudioDefaults> {
         let fallback_defaults = inspect_wpctl_status_defaults().await.ok();
         let output_device = inspect_wpctl("@DEFAULT_AUDIO_SINK@")
@@ -32,7 +32,7 @@ impl WpctlAudioRuntime {
             output_device,
             input_device,
             a2dp_sink_enabled,
-            hfp_ag_enabled,
+            hfp_hf_enabled,
         })
     }
 }

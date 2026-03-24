@@ -23,7 +23,7 @@ pub struct AudioDefaults {
     pub output_device: Option<String>,
     pub input_device: Option<String>,
     pub a2dp_sink_enabled: bool,
-    pub hfp_ag_enabled: bool,
+    pub hfp_hf_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

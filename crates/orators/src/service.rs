@@ -314,7 +314,7 @@ mod tests {
                 output_device: Some("Speakers".to_string()),
                 input_device: Some("Microphone".to_string()),
                 a2dp_sink_enabled: true,
-                hfp_ag_enabled: false,
+                hfp_hf_enabled: false,
             })
         }
 

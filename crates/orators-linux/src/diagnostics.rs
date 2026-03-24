@@ -81,12 +81,12 @@ pub async fn collect_report(
 
     let roles = wireplumber.roles(fragment_path).await.ok();
     checks.push(match roles {
-        Some(roles) if roles.hfp_ag_enabled => DiagnosticCheck {
+        Some(roles) if roles.hfp_hf_enabled => DiagnosticCheck {
             code: "bluetooth.policy".to_string(),
             severity: Severity::Info,
-            summary: "Bluetooth media and call support are enabled".to_string(),
+            summary: "Bluetooth media and hands-free call support are enabled".to_string(),
             detail: Some(
-                "Orators will prefer A2DP for normal playback and expose HFP when a voice app opens the microphone. Call sessions will use lower-fidelity HFP audio by design."
+                "Orators will prefer A2DP for normal playback and expose the hands-free HFP role when a voice app opens the microphone. Call sessions will use lower-fidelity HFP audio by design."
                     .to_string(),
             ),
             remediation: None,
@@ -122,7 +122,7 @@ pub async fn collect_report(
     let defaults = audio
         .current_defaults(
             roles.as_ref().is_some_and(|roles| roles.a2dp_sink_enabled),
-            roles.as_ref().is_some_and(|roles| roles.hfp_ag_enabled),
+            roles.as_ref().is_some_and(|roles| roles.hfp_hf_enabled),
         )
         .await;
     checks.push(match defaults {
@@ -170,7 +170,7 @@ pub async fn collect_report(
 
 fn expected_roles_label(call_audio_enabled: bool) -> &'static str {
     if call_audio_enabled {
-        "a2dp_sink, hfp_ag"
+        "a2dp_sink, hfp_hf"
     } else {
         "a2dp_sink"
     }
