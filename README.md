@@ -68,3 +68,7 @@ Legacy Bluetooth-mode fields are still ignored on load so existing configs remai
 4. If doctor reports that the host audio stack is unsupported or unhealthy, fix the host outside Orators first.
 5. If you are using the owned-backend MVP path, make sure `ffmpeg` and `pw-play` are installed in the user environment.
 6. Orators will not write WirePlumber fragments, saved `wpctl` settings, or other PipeWire session policy files.
+
+## License
+
+MIT. See [LICENSE](/home/notes/Projects/orators/LICENSE).
