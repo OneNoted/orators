@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use orators_core::SessionConfigStatus;
+use orators_core::{OratorsConfig, SessionConfigStatus};
 use tokio::fs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,8 +13,12 @@ pub struct WirePlumberRoles {
 pub struct WirePlumberRuntime;
 
 impl WirePlumberRuntime {
-    pub async fn ensure_fragment(&self, path: &Path) -> Result<SessionConfigStatus> {
-        let desired = render_fragment();
+    pub async fn ensure_fragment(
+        &self,
+        path: &Path,
+        config: &OratorsConfig,
+    ) -> Result<SessionConfigStatus> {
+        let desired = render_fragment(config);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -34,13 +38,17 @@ impl WirePlumberRuntime {
         })
     }
 
-    pub async fn inspect_fragment(&self, path: &Path) -> Result<SessionConfigStatus> {
+    pub async fn inspect_fragment(
+        &self,
+        path: &Path,
+        config: &OratorsConfig,
+    ) -> Result<SessionConfigStatus> {
         let current = fs::read_to_string(path)
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
         Ok(SessionConfigStatus {
             path: path.display().to_string(),
-            changed: current != render_fragment(),
+            changed: current != render_fragment(config),
         })
     }
 
@@ -52,12 +60,28 @@ impl WirePlumberRuntime {
     }
 }
 
-pub fn render_fragment() -> String {
-    r#"monitor.bluez.properties = {
-  bluez5.roles = [ a2dp_sink hfp_ag ]
-  bluez5.hfphsp-backend = "native"
+pub fn render_fragment(config: &OratorsConfig) -> String {
+    let roles = if config.call_audio_enabled {
+        "a2dp_sink hfp_ag"
+    } else {
+        "a2dp_sink"
+    };
+    let mut fragment = format!(
+        r#"monitor.bluez.properties = {{
+  bluez5.roles = [ {roles} ]
+"#
+    );
+
+    if config.call_audio_enabled {
+        fragment.push_str(
+            r#"  bluez5.hfphsp-backend = "native"
   bluez5.enable-msbc = true
-}
+"#,
+        );
+    }
+
+    fragment.push_str(
+        r#"}
 
 monitor.bluez.rules = [
   {
@@ -68,13 +92,15 @@ monitor.bluez.rules = [
     ]
     actions = {
       update-props = {
-        bluez5.auto-connect = [ a2dp_sink hfp_ag ]
+        bluez5.auto-connect = [ a2dp_sink ]
       }
     }
   }
 ]
-"#
-    .to_string()
+"#,
+    );
+
+    fragment
 }
 
 pub fn parse_roles(contents: &str) -> WirePlumberRoles {
@@ -86,12 +112,27 @@ pub fn parse_roles(contents: &str) -> WirePlumberRoles {
 
 #[cfg(test)]
 mod tests {
+    use orators_core::OratorsConfig;
+
     use super::{parse_roles, render_fragment};
 
     #[test]
-    fn fragment_enables_expected_roles() {
-        let roles = parse_roles(&render_fragment());
+    fn default_fragment_prefers_a2dp_only() {
+        let roles = parse_roles(&render_fragment(&OratorsConfig::default()));
+        assert!(roles.a2dp_sink_enabled);
+        assert!(!roles.hfp_ag_enabled);
+    }
+
+    #[test]
+    fn call_audio_fragment_enables_hfp_without_auto_connecting_it() {
+        let fragment = render_fragment(&OratorsConfig {
+            call_audio_enabled: true,
+            ..OratorsConfig::default()
+        });
+        let roles = parse_roles(&fragment);
+
         assert!(roles.a2dp_sink_enabled);
         assert!(roles.hfp_ag_enabled);
+        assert!(fragment.contains("bluez5.auto-connect = [ a2dp_sink ]"));
     }
 }

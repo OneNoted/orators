@@ -112,17 +112,20 @@ impl<R: PlatformRuntime> OratorsService<R> {
         self.runtime.start_pairing(timeout_secs).await?;
 
         let now = now_epoch_secs();
-        let mut state = self.state.lock().await;
-        state.start_pairing(now, Some(timeout_secs));
-        serialize(&state.status(now))
+        {
+            let mut state = self.state.lock().await;
+            state.start_pairing(now, Some(timeout_secs));
+        }
+        self.status_json().await
     }
 
     pub async fn stop_pairing(&self) -> Result<String> {
         self.runtime.stop_pairing().await?;
-        let now = now_epoch_secs();
-        let mut state = self.state.lock().await;
-        state.stop_pairing();
-        serialize(&state.status(now))
+        {
+            let mut state = self.state.lock().await;
+            state.stop_pairing();
+        }
+        self.status_json().await
     }
 
     pub async fn expire_pairing_if_needed(&self) -> Result<Option<String>> {
@@ -133,6 +136,7 @@ impl<R: PlatformRuntime> OratorsService<R> {
         };
 
         if expired {
+            tracing::info!("pairing window expired; keeping existing device connections intact");
             self.runtime.stop_pairing().await?;
             return Ok(Some(self.status_json().await?));
         }
@@ -229,7 +233,8 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use orators_core::{
-        AudioDefaults, DeviceInfo, DiagnosticsReport, OratorsConfig, SessionConfigStatus,
+        AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, OratorsConfig,
+        SessionConfigStatus, Severity,
     };
 
     use super::{OratorsService, PlatformRuntime};
@@ -237,6 +242,7 @@ mod tests {
     struct MockRuntime {
         devices: tokio::sync::Mutex<Vec<DeviceInfo>>,
         disconnects: tokio::sync::Mutex<Vec<String>>,
+        stop_pairing_calls: tokio::sync::Mutex<usize>,
     }
 
     impl MockRuntime {
@@ -244,6 +250,7 @@ mod tests {
             Self {
                 devices: tokio::sync::Mutex::new(devices),
                 disconnects: tokio::sync::Mutex::new(Vec::new()),
+                stop_pairing_calls: tokio::sync::Mutex::new(0),
             }
         }
     }
@@ -259,6 +266,7 @@ mod tests {
         }
 
         async fn stop_pairing(&self) -> Result<()> {
+            *self.stop_pairing_calls.lock().await += 1;
             Ok(())
         }
 
@@ -306,7 +314,7 @@ mod tests {
                 output_device: Some("Speakers".to_string()),
                 input_device: Some("Microphone".to_string()),
                 a2dp_sink_enabled: true,
-                hfp_ag_enabled: true,
+                hfp_ag_enabled: false,
             })
         }
 
@@ -320,7 +328,15 @@ mod tests {
         async fn diagnostics(&self) -> Result<DiagnosticsReport> {
             Ok(DiagnosticsReport {
                 generated_at_epoch_secs: 1,
-                checks: Vec::new(),
+                checks: vec![DiagnosticCheck {
+                    code: "bluez.adapter".to_string(),
+                    severity: Severity::Info,
+                    summary: "BlueZ adapter is ready for pairing".to_string(),
+                    detail: Some(
+                        "Look for Bluetooth device 'aeolus' (04:7F:0E:02:13:3C). powered=yes, discoverable=yes, pairable=yes, scanning=no.".to_string(),
+                    ),
+                    remediation: None,
+                }],
             })
         }
 
@@ -349,6 +365,7 @@ mod tests {
         let status = service.start_pairing(Some(30)).await.unwrap();
 
         assert!(status.contains("\"enabled\": true"));
+        assert!(status.contains("Speakers"));
     }
 
     #[tokio::test]
@@ -361,5 +378,21 @@ mod tests {
 
         let disconnects = runtime.disconnects.lock().await.clone();
         assert_eq!(disconnects, vec!["AA".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn expiring_pairing_keeps_active_device_connected() {
+        let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
+        let service = OratorsService::new(runtime.clone(), OratorsConfig::default());
+
+        service.connect_device("AA").await.unwrap();
+        service.start_pairing(Some(1)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let expired = service.expire_pairing_if_needed().await.unwrap().unwrap();
+        let expired: orators_core::RuntimeStatus = serde_json::from_str(&expired).unwrap();
+
+        assert_eq!(expired.active_device.as_deref(), Some("AA"));
+        assert_eq!(*runtime.stop_pairing_calls.lock().await, 1);
     }
 }

@@ -8,10 +8,12 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct OratorsConfig {
     pub pairing_timeout_secs: u64,
     pub auto_reconnect: bool,
     pub single_active_device: bool,
+    pub call_audio_enabled: bool,
     pub wireplumber_fragment_name: String,
 }
 
@@ -21,6 +23,7 @@ impl Default for OratorsConfig {
             pairing_timeout_secs: 120,
             auto_reconnect: true,
             single_active_device: true,
+            call_audio_enabled: false,
             wireplumber_fragment_name: "90-orators-bluetooth.conf".to_string(),
         }
     }
@@ -58,5 +61,26 @@ impl OratorsConfig {
             path: path.display().to_string(),
             changed: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OratorsConfig;
+
+    #[test]
+    fn missing_new_fields_use_defaults() {
+        let parsed: OratorsConfig = toml::from_str(
+            r#"
+pairing_timeout_secs = 45
+auto_reconnect = true
+single_active_device = true
+wireplumber_fragment_name = "90-orators-bluetooth.conf"
+"#,
+        )
+        .unwrap();
+
+        assert!(!parsed.call_audio_enabled);
+        assert_eq!(parsed.pairing_timeout_secs, 45);
     }
 }

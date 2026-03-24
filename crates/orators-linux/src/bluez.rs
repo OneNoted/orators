@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use orators_core::DeviceInfo;
+use orators_core::{BluetoothProfile, DeviceInfo};
 use zbus::{
     Connection, DBusError, Proxy,
     zvariant::{OwnedObjectPath, OwnedValue},
@@ -22,6 +22,17 @@ const NO_INPUT_NO_OUTPUT: &str = "NoInputNoOutput";
 type InterfaceProperties = HashMap<String, HashMap<String, OwnedValue>>;
 type ManagedObjects = HashMap<OwnedObjectPath, InterfaceProperties>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterInfo {
+    pub address: Option<String>,
+    pub alias: Option<String>,
+    pub name: Option<String>,
+    pub powered: bool,
+    pub discoverable: bool,
+    pub pairable: bool,
+    pub discovering: bool,
+}
+
 pub struct BluetoothCtlBluez {
     connection: Connection,
     agent_state: Arc<PairingAgentState>,
@@ -32,7 +43,7 @@ impl BluetoothCtlBluez {
         let connection = Connection::system()
             .await
             .context("failed to connect to system bus for BlueZ")?;
-        let agent_state = Arc::new(PairingAgentState::default());
+        let agent_state = Arc::new(PairingAgentState::new(connection.clone()));
 
         connection
             .object_server()
@@ -52,6 +63,24 @@ impl BluetoothCtlBluez {
         Ok(self.adapter_path().await.is_ok())
     }
 
+    pub async fn adapter_info(&self) -> Result<AdapterInfo> {
+        let managed = self.managed_objects().await?;
+        let adapter = managed
+            .values()
+            .find_map(|interfaces| interfaces.get("org.bluez.Adapter1"))
+            .context("no BlueZ adapter found")?;
+
+        Ok(AdapterInfo {
+            address: string_prop(adapter, "Address"),
+            alias: string_prop(adapter, "Alias"),
+            name: string_prop(adapter, "Name"),
+            powered: bool_prop(adapter, "Powered").unwrap_or(false),
+            discoverable: bool_prop(adapter, "Discoverable").unwrap_or(false),
+            pairable: bool_prop(adapter, "Pairable").unwrap_or(false),
+            discovering: bool_prop(adapter, "Discovering").unwrap_or(false),
+        })
+    }
+
     pub async fn list_devices(&self, auto_reconnect: bool) -> Result<Vec<DeviceInfo>> {
         let managed = self.managed_objects().await?;
         Ok(parse_devices(&managed, auto_reconnect))
@@ -69,8 +98,8 @@ impl BluetoothCtlBluez {
         )
         .await
         .context("failed to create BlueZ adapter proxy")?;
-        self.agent_state.set_pairing_active(true);
 
+        self.agent_state.set_pairing_window_open(true);
         let timeout = timeout_secs as u32;
         let result = async {
             adapter
@@ -98,7 +127,7 @@ impl BluetoothCtlBluez {
         .await;
 
         if result.is_err() {
-            self.agent_state.set_pairing_active(false);
+            self.agent_state.set_pairing_window_open(false);
         }
 
         result
@@ -114,7 +143,8 @@ impl BluetoothCtlBluez {
         )
         .await
         .context("failed to create BlueZ adapter proxy")?;
-        self.agent_state.set_pairing_active(false);
+
+        self.agent_state.set_pairing_window_open(false);
         adapter
             .set_property("Discoverable", false)
             .await
@@ -274,24 +304,65 @@ impl BluetoothCtlBluez {
     }
 }
 
-#[derive(Debug, Default)]
 struct PairingAgentState {
-    pairing_active: AtomicBool,
+    pairing_window_open: AtomicBool,
+    connection: Connection,
 }
 
 impl PairingAgentState {
-    fn set_pairing_active(&self, active: bool) {
-        self.pairing_active.store(active, Ordering::SeqCst);
+    fn new(connection: Connection) -> Self {
+        Self {
+            pairing_window_open: AtomicBool::new(false),
+            connection,
+        }
     }
 
-    fn ensure_pairing_active(&self) -> std::result::Result<(), AgentError> {
-        if self.pairing_active.load(Ordering::SeqCst) {
-            Ok(())
-        } else {
-            Err(AgentError::Rejected(
-                "pairing mode is not currently enabled".to_string(),
-            ))
-        }
+    fn set_pairing_window_open(&self, open: bool) {
+        self.pairing_window_open.store(open, Ordering::SeqCst);
+    }
+
+    async fn authorize_device(
+        &self,
+        device: &OwnedObjectPath,
+    ) -> std::result::Result<(), AgentError> {
+        let device_state = self.lookup_device_state(device).await?;
+        authorize_device_state(
+            self.pairing_window_open.load(Ordering::SeqCst),
+            device_state,
+        )
+    }
+
+    async fn lookup_device_state(
+        &self,
+        device: &OwnedObjectPath,
+    ) -> std::result::Result<DeviceAuthorizationState, AgentError> {
+        let proxy = Proxy::new(
+            &self.connection,
+            BLUEZ_SERVICE,
+            device.clone(),
+            "org.bluez.Device1",
+        )
+        .await
+        .map_err(AgentError::ZBus)?;
+
+        let paired = proxy
+            .get_property("Paired")
+            .await
+            .map_err(AgentError::ZBus)?;
+        let trusted = proxy
+            .get_property("Trusted")
+            .await
+            .map_err(AgentError::ZBus)?;
+        let connected = proxy
+            .get_property("Connected")
+            .await
+            .map_err(AgentError::ZBus)?;
+
+        Ok(DeviceAuthorizationState {
+            paired,
+            trusted,
+            connected,
+        })
     }
 }
 
@@ -311,6 +382,13 @@ enum AgentError {
     #[zbus(error)]
     ZBus(zbus::Error),
     Rejected(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceAuthorizationState {
+    paired: bool,
+    trusted: bool,
+    connected: bool,
 }
 
 #[zbus::interface(name = "org.bluez.Agent1")]
@@ -336,42 +414,48 @@ impl PairingAgent {
 
     fn display_passkey(&self, _device: OwnedObjectPath, _passkey: u32, _entered: u16) {}
 
-    fn request_confirmation(
+    async fn request_confirmation(
         &self,
-        _device: OwnedObjectPath,
+        device: OwnedObjectPath,
         _passkey: u32,
     ) -> std::result::Result<(), AgentError> {
-        self.state.ensure_pairing_active()
+        self.state.authorize_device(&device).await
     }
 
-    fn request_authorization(
+    async fn request_authorization(
         &self,
-        _device: OwnedObjectPath,
+        device: OwnedObjectPath,
     ) -> std::result::Result<(), AgentError> {
-        self.state.ensure_pairing_active()
+        self.state.authorize_device(&device).await
     }
 
-    fn authorize_service(
+    async fn authorize_service(
         &self,
-        _device: OwnedObjectPath,
+        device: OwnedObjectPath,
         _uuid: &str,
     ) -> std::result::Result<(), AgentError> {
-        self.state.ensure_pairing_active()
+        self.state.authorize_device(&device).await
     }
 
     fn cancel(&self) {}
 }
 
 fn parse_devices(managed: &ManagedObjects, auto_reconnect: bool) -> Vec<DeviceInfo> {
+    let active_profiles = parse_active_profiles(managed);
     managed
-        .values()
-        .filter_map(|interfaces| interfaces.get("org.bluez.Device1"))
-        .filter_map(|properties| parse_device(properties, auto_reconnect))
+        .iter()
+        .filter_map(|(path, interfaces)| {
+            interfaces.get("org.bluez.Device1").and_then(|properties| {
+                parse_device(path, properties, &active_profiles, auto_reconnect)
+            })
+        })
         .collect()
 }
 
 fn parse_device(
+    path: &OwnedObjectPath,
     properties: &HashMap<String, OwnedValue>,
+    active_profiles: &HashMap<String, BluetoothProfile>,
     auto_reconnect: bool,
 ) -> Option<DeviceInfo> {
     let address = string_prop(properties, "Address")?;
@@ -386,9 +470,59 @@ fn parse_device(
         trusted,
         paired,
         connected,
-        active_profile: None,
+        active_profile: active_profiles.get(path.as_str()).cloned(),
         auto_reconnect: auto_reconnect && trusted,
     })
+}
+
+fn parse_active_profiles(managed: &ManagedObjects) -> HashMap<String, BluetoothProfile> {
+    managed
+        .values()
+        .filter_map(|interfaces| interfaces.get("org.bluez.MediaTransport1"))
+        .filter_map(parse_transport_profile)
+        .collect()
+}
+
+fn parse_transport_profile(
+    properties: &HashMap<String, OwnedValue>,
+) -> Option<(String, BluetoothProfile)> {
+    let device_path = object_path_prop(properties, "Device")?;
+    let uuid = string_prop(properties, "UUID")?;
+    let profile = profile_from_uuid(&uuid)?;
+    Some((device_path.as_str().to_string(), profile))
+}
+
+fn profile_from_uuid(uuid: &str) -> Option<BluetoothProfile> {
+    let uuid = uuid.to_ascii_lowercase();
+    if matches!(
+        uuid.as_str(),
+        "0000110a-0000-1000-8000-00805f9b34fb" | "0000110b-0000-1000-8000-00805f9b34fb"
+    ) {
+        Some(BluetoothProfile::Media)
+    } else if matches!(
+        uuid.as_str(),
+        "00001108-0000-1000-8000-00805f9b34fb"
+            | "00001112-0000-1000-8000-00805f9b34fb"
+            | "0000111e-0000-1000-8000-00805f9b34fb"
+            | "0000111f-0000-1000-8000-00805f9b34fb"
+    ) {
+        Some(BluetoothProfile::Call)
+    } else {
+        None
+    }
+}
+
+fn authorize_device_state(
+    pairing_window_open: bool,
+    device: DeviceAuthorizationState,
+) -> std::result::Result<(), AgentError> {
+    if pairing_window_open || device.paired || device.trusted || device.connected {
+        Ok(())
+    } else {
+        Err(AgentError::Rejected(
+            "pairing window is closed for new devices".to_string(),
+        ))
+    }
 }
 
 fn string_prop(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
@@ -404,13 +538,27 @@ fn bool_prop(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<bool
         .and_then(|value| bool::try_from(value).ok())
 }
 
+fn object_path_prop(
+    properties: &HashMap<String, OwnedValue>,
+    key: &str,
+) -> Option<OwnedObjectPath> {
+    properties
+        .get(key)
+        .and_then(|value| value.try_clone().ok())
+        .and_then(|value| OwnedObjectPath::try_from(value).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use zbus::zvariant::{OwnedValue, Str};
+    use orators_core::BluetoothProfile;
+    use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Str};
 
-    use super::{AgentError, PairingAgentState, parse_device};
+    use super::{
+        AdapterInfo, AgentError, DeviceAuthorizationState, authorize_device_state, parse_device,
+        parse_transport_profile,
+    };
 
     #[test]
     fn parses_device_from_managed_properties() {
@@ -428,7 +576,13 @@ mod tests {
             ("Connected".to_string(), OwnedValue::from(false)),
         ]);
 
-        let device = parse_device(&properties, true).unwrap();
+        let device = parse_device(
+            &OwnedObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").unwrap(),
+            &properties,
+            &HashMap::new(),
+            true,
+        )
+        .unwrap();
         assert_eq!(device.address, "AA:BB:CC:DD:EE:FF");
         assert_eq!(device.alias.as_deref(), Some("Pixel 8 Pro"));
         assert!(device.trusted);
@@ -437,10 +591,67 @@ mod tests {
     }
 
     #[test]
-    fn pairing_agent_rejects_requests_when_pairing_is_inactive() {
-        let state = PairingAgentState::default();
-        let error = state.ensure_pairing_active().unwrap_err();
+    fn pairing_agent_rejects_new_devices_when_pairing_is_inactive() {
+        let error = authorize_device_state(
+            false,
+            DeviceAuthorizationState {
+                paired: false,
+                trusted: false,
+                connected: false,
+            },
+        )
+        .unwrap_err();
 
         assert!(matches!(error, AgentError::Rejected(_)));
+    }
+
+    #[test]
+    fn pairing_agent_allows_known_devices_when_pairing_is_inactive() {
+        authorize_device_state(
+            false,
+            DeviceAuthorizationState {
+                paired: true,
+                trusted: false,
+                connected: false,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parses_transport_profile_from_a2dp_uuid() {
+        let properties = HashMap::from([
+            (
+                "Device".to_string(),
+                OwnedValue::from(
+                    ObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").unwrap(),
+                ),
+            ),
+            (
+                "UUID".to_string(),
+                OwnedValue::from(Str::from("0000110b-0000-1000-8000-00805f9b34fb")),
+            ),
+        ]);
+
+        let (device_path, profile) = parse_transport_profile(&properties).unwrap();
+        assert_eq!(device_path, "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF");
+        assert_eq!(profile, BluetoothProfile::Media);
+    }
+
+    #[test]
+    fn adapter_info_captures_pairing_state() {
+        let info = AdapterInfo {
+            address: Some("04:7F:0E:02:13:3C".to_string()),
+            alias: Some("aeolus".to_string()),
+            name: Some("aeolus".to_string()),
+            powered: true,
+            discoverable: true,
+            pairable: true,
+            discovering: false,
+        };
+
+        assert!(info.powered);
+        assert!(info.discoverable);
+        assert_eq!(info.alias.as_deref(), Some("aeolus"));
     }
 }

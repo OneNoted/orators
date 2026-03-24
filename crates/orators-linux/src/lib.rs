@@ -85,7 +85,7 @@ impl LinuxPlatform {
     pub async fn apply_session_config(&self) -> Result<SessionConfigStatus> {
         let report = self
             .wireplumber
-            .ensure_fragment(&self.fragment_path)
+            .ensure_fragment(&self.fragment_path, &self.config)
             .await?;
         if report.changed {
             let _ = self.systemd.try_restart("wireplumber.service").await;
@@ -99,6 +99,7 @@ impl LinuxPlatform {
             &self.audio,
             &self.wireplumber,
             &self.fragment_path,
+            &self.config,
         )
         .await
     }
