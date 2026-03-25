@@ -50,6 +50,10 @@ impl OratorsState {
                     device.auto_reconnect = true;
                 }
 
+                if let Some(alias) = self.config.device_alias(&device.address) {
+                    device.alias = Some(alias.to_string());
+                }
+
                 (device.address.clone(), device)
             })
             .collect();
@@ -166,6 +170,16 @@ impl OratorsState {
         self.audio = audio;
     }
 
+    pub fn update_config(&mut self, config: OratorsConfig) {
+        self.config = config;
+        for device in self.devices.values_mut() {
+            device.auto_reconnect = self.config.auto_reconnect && device.trusted;
+            if let Some(alias) = self.config.device_alias(&device.address) {
+                device.alias = Some(alias.to_string());
+            }
+        }
+    }
+
     pub fn update_backend(&mut self, backend: MediaBackendStatus) {
         self.active_device = backend.active_device_address.clone();
         self.backend = backend;
@@ -258,5 +272,19 @@ mod tests {
         let status = state.status(10);
         assert!(status.active_device.is_none());
         assert!(status.devices.is_empty());
+    }
+
+    #[test]
+    fn local_alias_overrides_remote_alias() {
+        let mut config = OratorsConfig::default();
+        config.set_device_alias("AA", "Living Room Phone");
+        let mut state = OratorsState::new(config);
+        state.sync_devices(vec![sample_device("AA")]);
+
+        let status = state.status(10);
+        assert_eq!(
+            status.devices[0].alias.as_deref(),
+            Some("Living Room Phone")
+        );
     }
 }

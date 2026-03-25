@@ -1,4 +1,7 @@
-use std::{io::Write, path::{Path, PathBuf}};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use dirs::home_dir;
@@ -136,13 +139,8 @@ impl SystemdUserRuntime {
     pub async fn uninstall_system_backend(&self) -> Result<()> {
         self.run_sudo_allow_missing(["systemctl", "disable", "--now", SYSTEM_BACKEND_UNIT])
             .await?;
-        self.run_sudo_allow_missing([
-            "systemctl",
-            "disable",
-            "--now",
-            LEGACY_SYSTEM_BACKEND_UNIT,
-        ])
-        .await?;
+        self.run_sudo_allow_missing(["systemctl", "disable", "--now", LEGACY_SYSTEM_BACKEND_UNIT])
+            .await?;
         self.run_sudo([
             "rm",
             "-f",
@@ -336,7 +334,9 @@ impl SystemdUserRuntime {
         if fragment_path.exists() {
             let _ = fs::remove_file(fragment_path).await;
         }
-        let _ = self.run_user_systemctl(["try-restart", "wireplumber.service"]).await;
+        let _ = self
+            .run_user_systemctl(["try-restart", "wireplumber.service"])
+            .await;
         Ok(())
     }
 }

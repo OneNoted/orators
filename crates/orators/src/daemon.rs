@@ -25,7 +25,7 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
     tokio::fs::create_dir_all(&paths.state_dir).await?;
 
     let runtime = Arc::new(LinuxPlatform::new(config.clone()).await?);
-    let service = Arc::new(OratorsService::new(runtime, config));
+    let service = Arc::new(OratorsService::new(runtime, config, config_path));
 
     let monitor_service = Arc::clone(&service);
     tokio::spawn(async move {
@@ -132,6 +132,11 @@ impl DbusApi {
         self.service.list_devices_json().await.map_err(to_fdo)
     }
 
+    #[zbus(name = "GetConfig")]
+    async fn get_config(&self) -> fdo::Result<String> {
+        self.service.config_json().await.map_err(to_fdo)
+    }
+
     #[zbus(name = "TrustDevice")]
     async fn trust_device(
         &self,
@@ -139,6 +144,36 @@ impl DbusApi {
         #[zbus(signal_context)] ctxt: SignalContext<'_>,
     ) -> fdo::Result<String> {
         let status = self.service.trust_device(address).await.map_err(to_fdo)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(status)
+    }
+
+    #[zbus(name = "AllowDevice")]
+    async fn allow_device(
+        &self,
+        address: &str,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let status = self.service.allow_device(address).await.map_err(to_fdo)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(status)
+    }
+
+    #[zbus(name = "DisallowDevice")]
+    async fn disallow_device(
+        &self,
+        address: &str,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let status = self
+            .service
+            .disallow_device(address)
+            .await
+            .map_err(to_fdo)?;
         Self::status_changed(&ctxt, &status)
             .await
             .map_err(to_fdo_zbus)?;
@@ -209,6 +244,95 @@ impl DbusApi {
     #[zbus(name = "GetDiagnostics")]
     async fn get_diagnostics(&self) -> fdo::Result<String> {
         self.service.diagnostics_json().await.map_err(to_fdo)
+    }
+
+    #[zbus(name = "SetPairingTimeout")]
+    async fn set_pairing_timeout(
+        &self,
+        timeout_sec: u64,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let config = self
+            .service
+            .set_pairing_timeout(timeout_sec)
+            .await
+            .map_err(to_fdo)?;
+        let status = self.service.status_json().await.map_err(to_fdo)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(config)
+    }
+
+    #[zbus(name = "SetAutoReconnect")]
+    async fn set_auto_reconnect(
+        &self,
+        enabled: bool,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let config = self
+            .service
+            .set_auto_reconnect(enabled)
+            .await
+            .map_err(to_fdo)?;
+        let status = self.service.status_json().await.map_err(to_fdo)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(config)
+    }
+
+    #[zbus(name = "SetSingleActiveDevice")]
+    async fn set_single_active_device(
+        &self,
+        enabled: bool,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let config = self
+            .service
+            .set_single_active_device(enabled)
+            .await
+            .map_err(to_fdo)?;
+        let status = self.service.status_json().await.map_err(to_fdo)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(config)
+    }
+
+    #[zbus(name = "SetDeviceAlias")]
+    async fn set_device_alias(
+        &self,
+        address: &str,
+        alias: &str,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let status = self
+            .service
+            .set_device_alias(address, alias)
+            .await
+            .map_err(to_fdo)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(status)
+    }
+
+    #[zbus(name = "ClearDeviceAlias")]
+    async fn clear_device_alias(
+        &self,
+        address: &str,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let status = self
+            .service
+            .clear_device_alias(address)
+            .await
+            .map_err(to_fdo)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(status)
     }
 
     #[zbus(signal, name = "StatusChanged")]

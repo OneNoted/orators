@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -11,6 +11,7 @@ pub struct OratorsConfig {
     pub single_active_device: bool,
     pub adapter: Option<String>,
     pub allowed_devices: Vec<String>,
+    pub device_aliases: BTreeMap<String, String>,
 }
 
 impl Default for OratorsConfig {
@@ -21,6 +22,7 @@ impl Default for OratorsConfig {
             single_active_device: true,
             adapter: None,
             allowed_devices: Vec::new(),
+            device_aliases: BTreeMap::new(),
         }
     }
 }
@@ -33,6 +35,7 @@ struct RawOratorsConfig {
     single_active_device: bool,
     adapter: Option<String>,
     allowed_devices: Vec<String>,
+    device_aliases: BTreeMap<String, String>,
     bluetooth_mode: Option<String>,
     call_audio_enabled: Option<bool>,
     wireplumber_fragment_name: Option<String>,
@@ -47,6 +50,7 @@ impl Default for RawOratorsConfig {
             single_active_device: defaults.single_active_device,
             adapter: defaults.adapter,
             allowed_devices: defaults.allowed_devices,
+            device_aliases: defaults.device_aliases,
             bluetooth_mode: None,
             call_audio_enabled: None,
             wireplumber_fragment_name: None,
@@ -70,6 +74,7 @@ impl<'de> Deserialize<'de> for OratorsConfig {
             single_active_device: raw.single_active_device,
             adapter: normalize_adapter(raw.adapter),
             allowed_devices: normalize_allowed_devices(raw.allowed_devices),
+            device_aliases: normalize_device_aliases(raw.device_aliases),
         })
     }
 }
@@ -126,6 +131,31 @@ impl OratorsConfig {
         self.allowed_devices.retain(|item| item != &normalized);
         original_len != self.allowed_devices.len()
     }
+
+    pub fn device_alias(&self, address: &str) -> Option<&str> {
+        let normalized = normalize_device_address(address);
+        self.device_aliases.get(&normalized).map(String::as_str)
+    }
+
+    pub fn set_device_alias(&mut self, address: &str, alias: &str) -> bool {
+        let normalized = normalize_device_address(address);
+        let alias = alias.trim();
+        if alias.is_empty() {
+            return false;
+        }
+
+        let changed = self
+            .device_aliases
+            .get(&normalized)
+            .is_none_or(|existing| existing != alias);
+        self.device_aliases.insert(normalized, alias.to_string());
+        changed
+    }
+
+    pub fn clear_device_alias(&mut self, address: &str) -> bool {
+        let normalized = normalize_device_address(address);
+        self.device_aliases.remove(&normalized).is_some()
+    }
 }
 
 pub fn normalize_device_address(address: &str) -> String {
@@ -146,6 +176,20 @@ fn normalize_adapter(adapter: Option<String>) -> Option<String> {
     adapter
         .map(|adapter| adapter.trim().to_ascii_lowercase())
         .filter(|adapter| !adapter.is_empty())
+}
+
+fn normalize_device_aliases(aliases: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    aliases
+        .into_iter()
+        .filter_map(|(address, alias)| {
+            let alias = alias.trim().to_string();
+            if alias.is_empty() {
+                None
+            } else {
+                Some((normalize_device_address(&address), alias))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -211,5 +255,20 @@ allowed_devices = ["5c-dc-49-92-d0-d8", "5C:DC:49:92:D0:D8"]
         assert!(serialized.contains("allowed_devices = []"));
         assert!(!serialized.contains("call_audio_enabled"));
         assert!(!serialized.contains("bluetooth_mode"));
+    }
+
+    #[test]
+    fn device_aliases_are_normalized() {
+        let parsed: OratorsConfig = toml::from_str(
+            r#"
+[device_aliases]
+"5c-dc-49-92-d0-d8" = "Fold"
+"AA:BB:CC:DD:EE:FF" = "   "
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.device_alias("5c:dc:49:92:d0:d8"), Some("Fold"));
+        assert_eq!(parsed.device_aliases.len(), 1);
     }
 }

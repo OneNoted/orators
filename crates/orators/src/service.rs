@@ -90,15 +90,15 @@ impl PlatformRuntime for orators_linux::LinuxPlatform {
 }
 
 pub struct OratorsService<R> {
-    config: OratorsConfig,
+    config_path: PathBuf,
     runtime: Arc<R>,
     state: Mutex<OratorsState>,
 }
 
 impl<R: PlatformRuntime> OratorsService<R> {
-    pub fn new(runtime: Arc<R>, config: OratorsConfig) -> Self {
+    pub fn new(runtime: Arc<R>, config: OratorsConfig, config_path: PathBuf) -> Self {
         Self {
-            config: config.clone(),
+            config_path,
             runtime,
             state: Mutex::new(OratorsState::new(config)),
         }
@@ -126,8 +126,16 @@ impl<R: PlatformRuntime> OratorsService<R> {
         serialize(&status.devices)
     }
 
+    pub async fn config_json(&self) -> Result<String> {
+        let config = self.state.lock().await.config().clone();
+        serialize(&config)
+    }
+
     pub async fn start_pairing(&self, timeout_secs: Option<u64>) -> Result<String> {
-        let timeout_secs = timeout_secs.unwrap_or_else(|| self.default_timeout());
+        let timeout_secs = match timeout_secs {
+            Some(timeout_secs) => timeout_secs,
+            None => self.state.lock().await.config().pairing_timeout_secs,
+        };
         self.runtime.start_pairing(timeout_secs).await?;
 
         let now = now_epoch_secs();
@@ -222,6 +230,78 @@ impl<R: PlatformRuntime> OratorsService<R> {
         serialize(&report)
     }
 
+    pub async fn allow_device(&self, address: &str) -> Result<String> {
+        self.refresh_status().await?;
+        self.runtime.trust_device(address).await?;
+        self.update_config(|config| {
+            config.allow_device(address);
+            Ok(())
+        })
+        .await?;
+        self.status_json().await
+    }
+
+    pub async fn disallow_device(&self, address: &str) -> Result<String> {
+        self.refresh_status().await?;
+        self.runtime.untrust_device(address).await?;
+        self.update_config(|config| {
+            config.disallow_device(address);
+            Ok(())
+        })
+        .await?;
+        self.status_json().await
+    }
+
+    pub async fn set_pairing_timeout(&self, timeout_secs: u64) -> Result<String> {
+        self.update_config(|config| {
+            if timeout_secs == 0 {
+                anyhow::bail!("pairing timeout must be greater than zero");
+            }
+            config.pairing_timeout_secs = timeout_secs;
+            Ok(())
+        })
+        .await?;
+        self.config_json().await
+    }
+
+    pub async fn set_auto_reconnect(&self, enabled: bool) -> Result<String> {
+        self.update_config(|config| {
+            config.auto_reconnect = enabled;
+            Ok(())
+        })
+        .await?;
+        self.config_json().await
+    }
+
+    pub async fn set_single_active_device(&self, enabled: bool) -> Result<String> {
+        self.update_config(|config| {
+            config.single_active_device = enabled;
+            Ok(())
+        })
+        .await?;
+        self.config_json().await
+    }
+
+    pub async fn set_device_alias(&self, address: &str, alias: &str) -> Result<String> {
+        self.update_config(|config| {
+            if !config.set_device_alias(address, alias) {
+                anyhow::bail!("device alias must not be empty");
+            }
+            Ok(())
+        })
+        .await?;
+        self.status_json().await
+    }
+
+    pub async fn clear_device_alias(&self, address: &str) -> Result<String> {
+        self.update_config(|config| {
+            config.clear_device_alias(address);
+            Ok(())
+        })
+        .await?;
+        self.status_json().await
+    }
+
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<String> {
         let unit_path = self.runtime.install_user_service(daemon_path).await?;
         Ok(unit_path.display().to_string())
@@ -291,10 +371,11 @@ impl<R: PlatformRuntime> OratorsService<R> {
     }
 
     async fn apply_allowlist_if_needed(&self, devices: Vec<DeviceInfo>) -> Result<Vec<DeviceInfo>> {
+        let config = { self.state.lock().await.config().clone() };
         let allowlisted = devices
             .iter()
             .filter(|device| {
-                device.paired && !device.trusted && self.config.allows_device(&device.address)
+                device.paired && !device.trusted && config.allows_device(&device.address)
             })
             .map(|device| device.address.clone())
             .collect::<Vec<_>>();
@@ -312,9 +393,15 @@ impl<R: PlatformRuntime> OratorsService<R> {
 
         self.runtime.list_devices().await
     }
-
-    fn default_timeout(&self) -> u64 {
-        self.config.pairing_timeout_secs
+    async fn update_config<F>(&self, mutator: F) -> Result<OratorsConfig>
+    where
+        F: FnOnce(&mut OratorsConfig) -> Result<()>,
+    {
+        let mut config = { self.state.lock().await.config().clone() };
+        mutator(&mut config)?;
+        config.save(&self.config_path)?;
+        self.state.lock().await.update_config(config.clone());
+        Ok(config)
     }
 }
 
@@ -340,6 +427,7 @@ mod tests {
         AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, MediaBackendStatus,
         OratorsConfig, Severity,
     };
+    use tempfile::tempdir;
 
     struct MockRuntime {
         devices: tokio::sync::Mutex<Vec<DeviceInfo>>,
@@ -495,10 +583,14 @@ mod tests {
         }
     }
 
+    fn temp_config_path() -> PathBuf {
+        tempdir().unwrap().keep().join("orators-config.toml")
+    }
+
     #[tokio::test]
     async fn start_pairing_updates_status() {
         let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
-        let service = OratorsService::new(runtime, OratorsConfig::default());
+        let service = OratorsService::new(runtime, OratorsConfig::default(), temp_config_path());
 
         let status = service.start_pairing(Some(30)).await.unwrap();
 
@@ -509,7 +601,11 @@ mod tests {
     #[tokio::test]
     async fn disconnect_active_uses_runtime() {
         let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
-        let service = OratorsService::new(runtime.clone(), OratorsConfig::default());
+        let service = OratorsService::new(
+            runtime.clone(),
+            OratorsConfig::default(),
+            temp_config_path(),
+        );
         service.connect_device("AA").await.unwrap();
 
         service.disconnect_active().await.unwrap();
@@ -521,7 +617,11 @@ mod tests {
     #[tokio::test]
     async fn expiring_pairing_keeps_active_device_connected() {
         let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
-        let service = OratorsService::new(runtime.clone(), OratorsConfig::default());
+        let service = OratorsService::new(
+            runtime.clone(),
+            OratorsConfig::default(),
+            temp_config_path(),
+        );
 
         service.connect_device("AA").await.unwrap();
         service.start_pairing(Some(1)).await.unwrap();
@@ -539,7 +639,7 @@ mod tests {
         let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
         let mut config = OratorsConfig::default();
         config.allow_device("AA");
-        let service = OratorsService::new(runtime, config);
+        let service = OratorsService::new(runtime, config, temp_config_path());
 
         let status = service.status_json().await.unwrap();
         let status: orators_core::RuntimeStatus = serde_json::from_str(&status).unwrap();
@@ -550,8 +650,15 @@ mod tests {
 
     #[tokio::test]
     async fn second_connect_is_rejected_before_runtime_call() {
-        let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA"), sample_device("BB")]));
-        let service = OratorsService::new(runtime.clone(), OratorsConfig::default());
+        let runtime = Arc::new(MockRuntime::new(vec![
+            sample_device("AA"),
+            sample_device("BB"),
+        ]));
+        let service = OratorsService::new(
+            runtime.clone(),
+            OratorsConfig::default(),
+            temp_config_path(),
+        );
 
         service.connect_device("AA").await.unwrap();
         let error = service.connect_device("BB").await.unwrap_err();
@@ -559,5 +666,19 @@ mod tests {
         assert!(error.to_string().contains("already active"));
         let connects = runtime.connects.lock().await.clone();
         assert_eq!(connects, vec!["AA".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn alias_updates_are_persisted_and_reflected_in_status() {
+        let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
+        let config_path = temp_config_path();
+        let service = OratorsService::new(runtime, OratorsConfig::default(), config_path.clone());
+
+        let status = service.set_device_alias("AA", "Living Room").await.unwrap();
+        let status: orators_core::RuntimeStatus = serde_json::from_str(&status).unwrap();
+
+        assert_eq!(status.devices[0].alias.as_deref(), Some("Living Room"));
+        let saved = OratorsConfig::load_or_default(&config_path).unwrap();
+        assert_eq!(saved.device_alias("AA"), Some("Living Room"));
     }
 }
