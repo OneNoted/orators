@@ -13,6 +13,8 @@ use tokio::{process::Child, process::Command, sync::Mutex};
 const PLAYER_RESTART_BACKOFF: Duration = Duration::from_secs(3);
 const PLAYER_MAX_RESTARTS: u8 = 3;
 pub const SYSTEM_BACKEND_UNIT: &str = "orators-bluealsad.service";
+const PACKAGED_BLUEALSA_DIRS: &[&str] =
+    &["/usr/libexec/orators/bluealsa", "/usr/lib/orators/bluealsa"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BluealsaAssets {
@@ -23,16 +25,33 @@ pub struct BluealsaAssets {
 
 impl BluealsaAssets {
     pub fn discover() -> Result<Self> {
-        Ok(Self {
-            bluealsad: find_binary("bluealsad").context("failed to find `bluealsad` in PATH")?,
-            bluealsa_aplay: find_binary("bluealsa-aplay")
-                .context("failed to find `bluealsa-aplay` in PATH")?,
-            bluealsactl: find_binary("bluealsactl")
-                .context("failed to find `bluealsactl` in PATH")?,
-        })
+        if let Some(dir) = env::var_os("ORATORS_BLUEALSA_DIR") {
+            return Self::discover_in_dir(Path::new(&dir)).with_context(|| {
+                format!(
+                    "failed to discover BlueALSA assets in {}",
+                    Path::new(&dir).display()
+                )
+            });
+        }
+
+        for dir in PACKAGED_BLUEALSA_DIRS {
+            let dir = Path::new(dir);
+            if dir.exists() {
+                return Self::discover_in_dir(dir).with_context(|| {
+                    format!(
+                        "failed to discover packaged BlueALSA assets in {}",
+                        dir.display()
+                    )
+                });
+            }
+        }
+
+        Self::discover_in_path(
+            &env::var_os("PATH").context("failed to find BlueALSA assets in PATH")?,
+        )
+        .context("failed to find `bluealsad`, `bluealsa-aplay`, and `bluealsactl` in PATH")
     }
 
-    #[cfg(test)]
     fn discover_in_path(path: &OsStr) -> Result<Self> {
         Ok(Self {
             bluealsad: find_binary_in_path("bluealsad", path)
@@ -42,6 +61,22 @@ impl BluealsaAssets {
             bluealsactl: find_binary_in_path("bluealsactl", path)
                 .context("failed to find `bluealsactl` in PATH")?,
         })
+    }
+
+    fn discover_in_dir(dir: &Path) -> Result<Self> {
+        let assets = Self {
+            bluealsad: dir.join("bluealsad"),
+            bluealsa_aplay: dir.join("bluealsa-aplay"),
+            bluealsactl: dir.join("bluealsactl"),
+        };
+        if is_executable(&assets.bluealsad)
+            && is_executable(&assets.bluealsa_aplay)
+            && is_executable(&assets.bluealsactl)
+        {
+            Ok(assets)
+        } else {
+            anyhow::bail!("one or more BlueALSA binaries are missing or not executable");
+        }
     }
 }
 
@@ -238,11 +273,6 @@ impl PlayerSupervisor {
 
         Ok(())
     }
-}
-
-fn find_binary(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    find_binary_in_path(name, &path)
 }
 
 fn find_binary_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {

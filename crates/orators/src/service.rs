@@ -424,7 +424,7 @@ mod tests {
             Ok(AudioDefaults {
                 output_device: Some("Speakers".to_string()),
                 input_device: Some("Microphone".to_string()),
-                alsa_default_output_available: true,
+                local_output_available: true,
             })
         }
 

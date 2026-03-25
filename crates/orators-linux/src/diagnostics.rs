@@ -54,11 +54,9 @@ pub async fn collect_report(
     checks.push(assets_check(BluealsaAssets::discover().ok().as_ref()));
     checks.push(fragment_check(systemd.wireplumber_fragment_installed()?));
     checks.push(system_backend_check(backend_service.as_ref()));
-    checks.push(aplay_check(audio.aplay_available().await.ok()));
-
     let defaults = audio.current_defaults().await.ok();
-    checks.push(alsa_default_check(defaults.as_ref()));
-    checks.push(local_output_check(defaults.as_ref()));
+    checks.push(local_output_ready_check(defaults.as_ref()));
+    checks.push(local_output_devices_check(defaults.as_ref()));
 
     let active_device = bluez.remote_devices().await.ok().and_then(|devices| {
         devices
@@ -204,56 +202,35 @@ fn system_backend_check(status: Option<&ServiceStatus>) -> DiagnosticCheck {
     }
 }
 
-fn aplay_check(aplay_available: Option<bool>) -> DiagnosticCheck {
-    match aplay_available {
-        Some(true) => DiagnosticCheck {
-            code: "alsa.aplay".to_string(),
-            severity: Severity::Info,
-            summary: "ALSA playback tools are available".to_string(),
-            detail: Some("`aplay` is available for local ALSA playback checks.".to_string()),
-            remediation: None,
-        },
-        Some(false) | None => DiagnosticCheck {
-            code: "alsa.aplay".to_string(),
-            severity: Severity::Error,
-            summary: "ALSA playback tools are missing".to_string(),
-            detail: Some("`aplay` could not be executed on this host.".to_string()),
-            remediation: Some(
-                "Install `alsa-utils` so `bluealsa-aplay` has a usable ALSA playback target."
-                    .to_string(),
-            ),
-        },
-    }
-}
-
-fn alsa_default_check(defaults: Option<&orators_core::AudioDefaults>) -> DiagnosticCheck {
+fn local_output_ready_check(defaults: Option<&orators_core::AudioDefaults>) -> DiagnosticCheck {
     match defaults {
-        Some(defaults) if defaults.alsa_default_output_available => DiagnosticCheck {
-            code: "alsa.default".to_string(),
+        Some(defaults) if defaults.local_output_available => DiagnosticCheck {
+            code: "local.output".to_string(),
             severity: Severity::Info,
-            summary: "ALSA default output is available".to_string(),
+            summary: "A local playback output is available".to_string(),
             detail: Some(
-                "The host exposes an ALSA `default` output path for `bluealsa-aplay`."
+                "The current desktop audio session exposes a playback output that BlueALSA can target through the ALSA/PipeWire stack."
                     .to_string(),
             ),
             remediation: None,
         },
         Some(_) => DiagnosticCheck {
-            code: "alsa.default".to_string(),
+            code: "local.output".to_string(),
             severity: Severity::Error,
-            summary: "ALSA default output is not available".to_string(),
+            summary: "No usable local playback output is available".to_string(),
             detail: Some(
-                "`aplay -L` did not expose an ALSA `default` playback target.".to_string(),
+                "The current user audio session does not expose a default playback output."
+                    .to_string(),
             ),
             remediation: Some(
-                "Fix the local ALSA/PipeWire playback stack so `default` exists before using Orators."
+                "Fix the local ALSA/PipeWire playback stack so a real playback output exists before using Orators."
                     .to_string(),
             ),
         },
         None => DiagnosticCheck {
-            code: "alsa.default".to_string(),
+            code: "local.output".to_string(),
             severity: Severity::Warn,
-            summary: "ALSA default output could not be inspected".to_string(),
+            summary: "Local playback output could not be inspected".to_string(),
             detail: Some("Local audio defaults could not be queried.".to_string()),
             remediation: Some(
                 "Make sure ALSA and PipeWire are healthy before using Orators.".to_string(),
@@ -262,10 +239,10 @@ fn alsa_default_check(defaults: Option<&orators_core::AudioDefaults>) -> Diagnos
     }
 }
 
-fn local_output_check(defaults: Option<&orators_core::AudioDefaults>) -> DiagnosticCheck {
+fn local_output_devices_check(defaults: Option<&orators_core::AudioDefaults>) -> DiagnosticCheck {
     let Some(defaults) = defaults else {
         return DiagnosticCheck {
-            code: "local.output".to_string(),
+            code: "local.output_devices".to_string(),
             severity: Severity::Warn,
             summary: "Current desktop output could not be detected".to_string(),
             detail: Some("`wpctl inspect` did not return a current sink/source.".to_string()),
@@ -274,7 +251,7 @@ fn local_output_check(defaults: Option<&orators_core::AudioDefaults>) -> Diagnos
     };
 
     DiagnosticCheck {
-        code: "local.output".to_string(),
+        code: "local.output_devices".to_string(),
         severity: Severity::Info,
         summary: "Current desktop output devices were discovered".to_string(),
         detail: Some(format!(
@@ -324,7 +301,7 @@ fn backend_ready_check(
         && fragment_installed
         && backend_service
             .is_some_and(|status| status.active_state == "active" && status.sub_state == "running")
-        && defaults.is_some_and(|defaults| defaults.alsa_default_output_available);
+        && defaults.is_some_and(|defaults| defaults.local_output_available);
 
     if ready {
         DiagnosticCheck {
@@ -343,11 +320,11 @@ fn backend_ready_check(
             severity: Severity::Error,
             summary: "This host is not ready for the BlueALSA Bluetooth backend".to_string(),
             detail: Some(
-                "Orators needs a BlueZ adapter, BlueALSA binaries, the managed WirePlumber fragment, a healthy `orators-bluealsad.service`, and a usable ALSA `default` output."
+                "Orators needs a BlueZ adapter, BlueALSA binaries, the managed WirePlumber fragment, a healthy `orators-bluealsad.service`, and a usable local playback output."
                     .to_string(),
             ),
             remediation: Some(
-                "Run `oratorsctl install-system-backend`, verify the system backend is healthy, and make sure ALSA default output is available."
+                "Run `oratorsctl install-system-backend`, verify the system backend is healthy, and make sure the host exposes a local playback output."
                     .to_string(),
             ),
         }

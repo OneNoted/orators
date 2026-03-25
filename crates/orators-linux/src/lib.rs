@@ -191,11 +191,9 @@ impl LinuxPlatform {
             .await?
             .context("the Orators BlueALSA system service is not healthy")?;
 
-        if !self.audio.aplay_available().await? {
-            anyhow::bail!("`aplay` is not available on this host");
-        }
-        if !self.audio.alsa_default_output_available().await? {
-            anyhow::bail!("ALSA does not currently expose a usable `default` output");
+        let defaults = self.audio.current_defaults().await?;
+        if !defaults.local_output_available {
+            anyhow::bail!("the host does not currently expose a usable local playback output");
         }
 
         Ok(())

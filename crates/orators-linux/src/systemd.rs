@@ -8,10 +8,12 @@ use crate::bluealsa::{BluealsaAssets, SYSTEM_BACKEND_UNIT};
 
 const USER_UNIT_NAME: &str = "oratorsd.service";
 const BACKEND_FRAGMENT_NAME: &str = "90-orators-disable-bluez.conf";
+const BACKEND_DBUS_POLICY_NAME: &str = "orators-bluealsa.conf";
 const LEGACY_WIREPLUMBER_DROPIN: &str = "90-orators-audio-owner.conf";
 const LEGACY_WIREPLUMBER_FRAGMENT: &str = "90-orators-bluetooth.conf";
 const LEGACY_SYSTEM_BACKEND_UNIT: &str = "orators-bluealsa.service";
 const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
+const SYSTEM_DBUS_POLICY_DIR: &str = "/etc/dbus-1/system.d";
 
 pub struct SystemdUserRuntime;
 
@@ -27,6 +29,7 @@ pub struct ServiceStatus {
 pub struct SystemBackendInstallResult {
     pub user_service_path: PathBuf,
     pub wireplumber_fragment_path: PathBuf,
+    pub dbus_policy_path: PathBuf,
     pub system_unit_path: PathBuf,
     pub adapter: String,
 }
@@ -63,12 +66,15 @@ impl SystemdUserRuntime {
         fs::write(&fragment_path, render_wireplumber_fragment()).await?;
 
         let system_unit_path = system_backend_unit_path();
+        let dbus_policy_path = system_backend_dbus_policy_path();
         let temp_unit_path = std::env::temp_dir().join("orators-bluealsad.service");
+        let temp_policy_path = std::env::temp_dir().join(BACKEND_DBUS_POLICY_NAME);
         fs::write(
             &temp_unit_path,
             render_system_backend_unit(&assets.bluealsad, adapter),
         )
         .await?;
+        fs::write(&temp_policy_path, render_system_backend_dbus_policy()).await?;
         self.run_sudo([
             "install",
             "-Dm644",
@@ -76,7 +82,15 @@ impl SystemdUserRuntime {
             system_unit_path.to_string_lossy().as_ref(),
         ])
         .await?;
+        self.run_sudo([
+            "install",
+            "-Dm644",
+            temp_policy_path.to_string_lossy().as_ref(),
+            dbus_policy_path.to_string_lossy().as_ref(),
+        ])
+        .await?;
         let _ = fs::remove_file(&temp_unit_path).await;
+        let _ = fs::remove_file(&temp_policy_path).await;
 
         self.run_sudo([
             "rm",
@@ -84,7 +98,18 @@ impl SystemdUserRuntime {
             legacy_system_backend_unit_path().to_string_lossy().as_ref(),
         ])
         .await?;
+        self.run_sudo([
+            "busctl",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ReloadConfig",
+        ])
+        .await?;
         self.run_sudo(["systemctl", "daemon-reload"]).await?;
+        self.run_sudo(["systemctl", "reset-failed", SYSTEM_BACKEND_UNIT])
+            .await?;
         self.run_sudo(["systemctl", "enable", "--now", SYSTEM_BACKEND_UNIT])
             .await?;
         self.run_user_systemctl(["try-restart", "wireplumber.service"])
@@ -93,6 +118,7 @@ impl SystemdUserRuntime {
         Ok(SystemBackendInstallResult {
             user_service_path: user_unit_path()?,
             wireplumber_fragment_path: fragment_path,
+            dbus_policy_path,
             system_unit_path,
             adapter: adapter.to_string(),
         })
@@ -116,7 +142,24 @@ impl SystemdUserRuntime {
             .run_sudo([
                 "rm",
                 "-f",
+                system_backend_dbus_policy_path().to_string_lossy().as_ref(),
+            ])
+            .await;
+        let _ = self
+            .run_sudo([
+                "rm",
+                "-f",
                 legacy_system_backend_unit_path().to_string_lossy().as_ref(),
+            ])
+            .await;
+        let _ = self
+            .run_sudo([
+                "busctl",
+                "call",
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "ReloadConfig",
             ])
             .await;
         let _ = self.run_sudo(["systemctl", "daemon-reload"]).await;
@@ -268,6 +311,10 @@ fn system_backend_unit_path() -> PathBuf {
     Path::new(SYSTEM_UNIT_DIR).join(SYSTEM_BACKEND_UNIT)
 }
 
+fn system_backend_dbus_policy_path() -> PathBuf {
+    Path::new(SYSTEM_DBUS_POLICY_DIR).join(BACKEND_DBUS_POLICY_NAME)
+}
+
 fn legacy_system_backend_unit_path() -> PathBuf {
     Path::new(SYSTEM_UNIT_DIR).join(LEGACY_SYSTEM_BACKEND_UNIT)
 }
@@ -315,6 +362,21 @@ pub fn render_system_backend_unit(bluealsad_path: &Path, adapter: &str) -> Strin
     )
 }
 
+pub fn render_system_backend_dbus_policy() -> &'static str {
+    r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="root">
+    <allow own="org.bluealsa"/>
+    <allow send_destination="org.bluez"/>
+  </policy>
+  <policy context="default">
+    <allow send_destination="org.bluealsa"/>
+  </policy>
+</busconfig>
+"#
+}
+
 pub fn render_wireplumber_fragment() -> &'static str {
     "wireplumber.profiles = {\n  main = {\n    monitor.bluez = disabled\n    monitor.bluez-midi = disabled\n  }\n}\n"
 }
@@ -324,8 +386,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        parse_service_status, render_system_backend_unit, render_user_unit,
-        render_wireplumber_fragment,
+        parse_service_status, render_system_backend_dbus_policy, render_system_backend_unit,
+        render_user_unit, render_wireplumber_fragment,
     };
 
     #[test]
@@ -347,6 +409,13 @@ mod tests {
         let fragment = render_wireplumber_fragment();
         assert!(fragment.contains("monitor.bluez = disabled"));
         assert!(fragment.contains("monitor.bluez-midi = disabled"));
+    }
+
+    #[test]
+    fn renders_dbus_policy() {
+        let policy = render_system_backend_dbus_policy();
+        assert!(policy.contains("allow own=\"org.bluealsa\""));
+        assert!(policy.contains("allow send_destination=\"org.bluealsa\""));
     }
 
     #[test]

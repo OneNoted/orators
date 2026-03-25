@@ -257,6 +257,7 @@ async fn install_system_backend(json: bool, adapter: Option<String>) -> Result<(
         let payload = serde_json::json!({
             "user_service_path": user_unit_path,
             "wireplumber_fragment_path": install.wireplumber_fragment_path,
+            "dbus_policy_path": install.dbus_policy_path,
             "system_unit_path": install.system_unit_path,
             "adapter": install.adapter,
         });
@@ -266,6 +267,10 @@ async fn install_system_backend(json: bool, adapter: Option<String>) -> Result<(
         println!(
             "Installed WirePlumber Bluetooth-disable fragment at {}.",
             install.wireplumber_fragment_path.display()
+        );
+        println!(
+            "Installed BlueALSA D-Bus policy at {}.",
+            install.dbus_policy_path.display()
         );
         println!(
             "Installed BlueALSA system backend at {}.",
@@ -431,8 +436,8 @@ fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&Diagnostics
             .unwrap_or("not detected")
     );
     println!(
-        "ALSA default output: {}",
-        yes_no(status.audio.alsa_default_output_available)
+        "Local playback output: {}",
+        yes_no(status.audio.local_output_available)
     );
     println!(
         "Backend: {}",

@@ -64,7 +64,7 @@ pub struct DeviceInfo {
 pub struct AudioDefaults {
     pub output_device: Option<String>,
     pub input_device: Option<String>,
-    pub alsa_default_output_available: bool,
+    pub local_output_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
