@@ -17,6 +17,7 @@ const BLUEZ_SERVICE: &str = "org.bluez";
 const BLUEZ_ROOT_PATH: &str = "/";
 const AGENT_MANAGER_PATH: &str = "/org/bluez";
 const AGENT_PATH: &str = "/dev/orators/bluez/agent";
+const A2DP_SOURCE_UUID: &str = "0000110a-0000-1000-8000-00805f9b34fb";
 const A2DP_SINK_UUID: &str = "0000110b-0000-1000-8000-00805f9b34fb";
 const NO_INPUT_NO_OUTPUT: &str = "NoInputNoOutput";
 
@@ -226,6 +227,7 @@ impl BluetoothCtlBluez {
     }
 
     pub async fn connect_device(&self, address: &str) -> Result<()> {
+        let managed = self.managed_objects().await?;
         let device_path = self.device_path(address).await?;
         let device = Proxy::new(
             &self.connection,
@@ -235,10 +237,24 @@ impl BluetoothCtlBluez {
         )
         .await
         .with_context(|| format!("failed to create BlueZ device proxy for {address}"))?;
-        device
-            .call_method("ConnectProfile", &(A2DP_SINK_UUID))
-            .await
-            .with_context(|| format!("failed to connect A2DP profile for device {address}"))?;
+        let media_uuid = managed
+            .get(&device_path)
+            .and_then(|interfaces| interfaces.get("org.bluez.Device1"))
+            .and_then(|properties| string_array_prop(properties, "UUIDs"))
+            .as_deref()
+            .and_then(select_media_profile_uuid);
+
+        if let Some(media_uuid) = media_uuid {
+            device
+                .call_method("ConnectProfile", &(media_uuid))
+                .await
+                .with_context(|| format!("failed to connect media profile for device {address}"))?;
+        } else {
+            device
+                .call_method("Connect", &())
+                .await
+                .with_context(|| format!("failed to connect device {address}"))?;
+        }
         Ok(())
     }
 
@@ -528,10 +544,7 @@ fn parse_transport_profile(
 
 fn profile_from_uuid(uuid: &str) -> Option<BluetoothProfile> {
     let uuid = uuid.to_ascii_lowercase();
-    if matches!(
-        uuid.as_str(),
-        "0000110a-0000-1000-8000-00805f9b34fb" | "0000110b-0000-1000-8000-00805f9b34fb"
-    ) {
+    if matches!(uuid.as_str(), A2DP_SOURCE_UUID | A2DP_SINK_UUID) {
         Some(BluetoothProfile::Media)
     } else if matches!(
         uuid.as_str(),
@@ -541,6 +554,22 @@ fn profile_from_uuid(uuid: &str) -> Option<BluetoothProfile> {
             | "0000111f-0000-1000-8000-00805f9b34fb"
     ) {
         Some(BluetoothProfile::Call)
+    } else {
+        None
+    }
+}
+
+fn select_media_profile_uuid(uuids: &[String]) -> Option<&'static str> {
+    if uuids
+        .iter()
+        .any(|uuid| uuid.eq_ignore_ascii_case(A2DP_SOURCE_UUID))
+    {
+        Some(A2DP_SOURCE_UUID)
+    } else if uuids
+        .iter()
+        .any(|uuid| uuid.eq_ignore_ascii_case(A2DP_SINK_UUID))
+    {
+        Some(A2DP_SINK_UUID)
     } else {
         None
     }
@@ -613,8 +642,8 @@ mod tests {
     use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Str};
 
     use super::{
-        AdapterInfo, AgentError, DeviceAuthorizationState, authorize_device_state, parse_device,
-        parse_transport_profile,
+        A2DP_SINK_UUID, A2DP_SOURCE_UUID, AdapterInfo, AgentError, DeviceAuthorizationState,
+        authorize_device_state, parse_device, parse_transport_profile, select_media_profile_uuid,
     };
 
     #[test]
@@ -713,6 +742,30 @@ mod tests {
         let (device_path, profile) = parse_transport_profile(&properties).unwrap();
         assert_eq!(device_path, "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF");
         assert_eq!(profile, BluetoothProfile::Call);
+    }
+
+    #[test]
+    fn prefers_a2dp_source_uuid_when_available() {
+        let uuids = vec![
+            "0000110b-0000-1000-8000-00805f9b34fb".to_string(),
+            "0000110a-0000-1000-8000-00805f9b34fb".to_string(),
+        ];
+
+        assert_eq!(select_media_profile_uuid(&uuids), Some(A2DP_SOURCE_UUID));
+    }
+
+    #[test]
+    fn falls_back_to_a2dp_sink_uuid_when_source_is_missing() {
+        let uuids = vec!["0000110b-0000-1000-8000-00805f9b34fb".to_string()];
+
+        assert_eq!(select_media_profile_uuid(&uuids), Some(A2DP_SINK_UUID));
+    }
+
+    #[test]
+    fn returns_none_when_no_media_uuid_is_available() {
+        let uuids = vec!["00001108-0000-1000-8000-00805f9b34fb".to_string()];
+
+        assert_eq!(select_media_profile_uuid(&uuids), None);
     }
 
     #[test]

@@ -5,6 +5,7 @@ use dirs::home_dir;
 use tokio::{fs, process::Command};
 
 const UNIT_NAME: &str = "oratorsd.service";
+const LEGACY_WIREPLUMBER_DROPIN: &str = "90-orators-audio-owner.conf";
 
 pub struct SystemdUserRuntime;
 
@@ -18,6 +19,7 @@ pub struct UserServiceStatus {
 
 impl SystemdUserRuntime {
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {
+        self.cleanup_legacy_wireplumber_dropin().await?;
         let unit_path = unit_path()?;
         if let Some(parent) = unit_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -35,6 +37,22 @@ impl SystemdUserRuntime {
 
     pub async fn try_restart(&self, unit_name: &str) -> Result<()> {
         self.run_systemctl(["try-restart", unit_name]).await
+    }
+
+    pub async fn cleanup_legacy_wireplumber_dropin(&self) -> Result<bool> {
+        let dropin_path = legacy_wireplumber_dropin_path()?;
+        if !dropin_path.exists() {
+            return Ok(false);
+        }
+
+        fs::remove_file(&dropin_path).await.with_context(|| {
+            format!(
+                "failed to remove legacy WirePlumber drop-in {}",
+                dropin_path.display()
+            )
+        })?;
+        self.run_systemctl(["daemon-reload"]).await?;
+        Ok(true)
     }
 
     pub async fn service_status(&self, unit_name: &str) -> Result<UserServiceStatus> {
@@ -84,6 +102,13 @@ impl SystemdUserRuntime {
 fn unit_path() -> Result<PathBuf> {
     let home = home_dir().context("unable to determine home directory")?;
     Ok(home.join(".config/systemd/user").join(UNIT_NAME))
+}
+
+fn legacy_wireplumber_dropin_path() -> Result<PathBuf> {
+    let home = home_dir().context("unable to determine home directory")?;
+    Ok(home
+        .join(".config/systemd/user/wireplumber.service.d")
+        .join(LEGACY_WIREPLUMBER_DROPIN))
 }
 
 fn parse_service_status(output: &str) -> Result<UserServiceStatus> {

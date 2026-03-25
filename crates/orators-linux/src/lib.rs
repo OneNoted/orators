@@ -22,10 +22,17 @@ pub struct LinuxPlatform {
 
 impl LinuxPlatform {
     pub async fn new(config: OratorsConfig) -> Result<Self> {
+        let systemd = SystemdUserRuntime;
+        if let Err(error) = systemd.cleanup_legacy_wireplumber_dropin().await {
+            tracing::warn!(
+                ?error,
+                "failed to clean up legacy WirePlumber Bluetooth ownership state"
+            );
+        }
         Ok(Self {
             bluez: BluetoothCtlBluez::new().await?,
             audio: WpctlAudioRuntime,
-            systemd: SystemdUserRuntime,
+            systemd,
             config,
         })
     }
