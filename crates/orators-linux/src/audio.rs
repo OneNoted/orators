@@ -1,16 +1,12 @@
 use std::{process::Output, time::Duration};
 
 use anyhow::{Context, Result};
-use orators_core::{AudioDefaults, BluetoothProfile};
-use serde_json::Value;
+use orators_core::AudioDefaults;
 use tokio::process::Command;
 
 pub struct WpctlAudioRuntime;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const HEADSET_AUTOSWITCH_SETTING: &str = "bluetooth.autoswitch-to-headset-profile";
-const DEVICE_RESTORE_PROFILE_SETTING: &str = "device.restore-profile";
-const BLUETOOTH_PERSISTENT_STORAGE_SETTING: &str = "bluetooth.use-persistent-storage";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipeWireDefaults {
@@ -19,46 +15,9 @@ pub struct PipeWireDefaults {
     pub output_is_dummy: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BluetoothRuntimeSettings {
-    pub headset_autoswitch: Option<bool>,
-    pub device_restore_profile: Option<bool>,
-    pub bluetooth_persistent_storage: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BluetoothProfileOption {
-    pub index: u32,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BluetoothCard {
-    pub id: u32,
-    pub address: Option<String>,
-    pub name: String,
-    pub active_profile_name: Option<String>,
-    pub available_profiles: Vec<BluetoothProfileOption>,
-}
-
 impl WpctlAudioRuntime {
-    pub async fn current_defaults(
-        &self,
-        bluetooth_audio_supported: bool,
-        call_roles_detected: bool,
-        active_device_address: Option<&str>,
-    ) -> Result<AudioDefaults> {
+    pub async fn current_defaults(&self) -> Result<AudioDefaults> {
         let defaults = self.pipewire_defaults().await?;
-        let bluetooth_cards = self.bluetooth_cards().await.unwrap_or_default();
-        let active_card = active_device_address.and_then(|address| {
-            bluetooth_cards
-                .iter()
-                .find(|card| card_matches_address(card, address))
-        });
-        let active_bluetooth_profile = active_card
-            .and_then(|card| card.active_profile_name.as_deref())
-            .and_then(profile_name_to_kind);
-
         let output_device = inspect_wpctl("@DEFAULT_AUDIO_SINK@")
             .await
             .ok()
@@ -71,12 +30,7 @@ impl WpctlAudioRuntime {
         Ok(AudioDefaults {
             output_device,
             input_device,
-            bluetooth_audio_supported,
-            call_roles_detected,
-            active_bluetooth_profile,
-            a2dp_pinned: active_card
-                .and_then(|card| card.active_profile_name.as_deref())
-                .is_none_or(is_a2dp_profile_name),
+            media_backend: Default::default(),
         })
     }
 
@@ -104,74 +58,6 @@ impl WpctlAudioRuntime {
             output_device,
             input_device,
         })
-    }
-
-    pub async fn bluetooth_cards(&self) -> Result<Vec<BluetoothCard>> {
-        let output = run_command("pw-dump", &[]).await?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "pw-dump failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
-        parse_pw_dump_bluetooth_cards(&String::from_utf8_lossy(&output.stdout))
-            .context("failed to parse pw-dump Bluetooth cards")
-    }
-
-    pub async fn bluetooth_runtime_settings(&self) -> Result<BluetoothRuntimeSettings> {
-        Ok(BluetoothRuntimeSettings {
-            headset_autoswitch: self
-                .read_runtime_setting_bool(HEADSET_AUTOSWITCH_SETTING)
-                .await?,
-            device_restore_profile: self
-                .read_runtime_setting_bool(DEVICE_RESTORE_PROFILE_SETTING)
-                .await?,
-            bluetooth_persistent_storage: self
-                .read_runtime_setting_bool(BLUETOOTH_PERSISTENT_STORAGE_SETTING)
-                .await?,
-        })
-    }
-
-    pub async fn apply_media_stability_settings(&self) -> Result<()> {
-        self.set_runtime_setting(HEADSET_AUTOSWITCH_SETTING, false)
-            .await?;
-        self.set_runtime_setting(DEVICE_RESTORE_PROFILE_SETTING, false)
-            .await?;
-        self.set_runtime_setting(BLUETOOTH_PERSISTENT_STORAGE_SETTING, false)
-            .await?;
-        Ok(())
-    }
-
-    async fn read_runtime_setting_bool(&self, key: &str) -> Result<Option<bool>> {
-        let output = run_command("wpctl", &["settings", key]).await?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "wpctl settings {key} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
-        Ok(parse_wpctl_setting_bool(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
-    }
-
-    async fn set_runtime_setting(&self, key: &str, value: bool) -> Result<()> {
-        let output = run_command(
-            "wpctl",
-            &["settings", key, if value { "true" } else { "false" }],
-        )
-        .await?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "wpctl settings {key} {} failed: {}",
-                if value { "true" } else { "false" },
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
     }
 }
 
@@ -245,6 +131,7 @@ fn parse_wpctl_status_defaults(output: &str) -> StatusDefaults {
     defaults
 }
 
+#[cfg(test)]
 fn parse_wpctl_setting_bool(output: &str) -> Option<bool> {
     output.lines().map(str::trim).find_map(|line| {
         let value = line.strip_prefix("Value:")?.trim();
@@ -275,129 +162,15 @@ async fn run_spawned_command(mut command: Command, label: String) -> Result<Outp
         .with_context(|| format!("failed to invoke {label}"))
 }
 
-fn parse_pw_dump_bluetooth_cards(output: &str) -> Option<Vec<BluetoothCard>> {
-    let objects = serde_json::from_str::<Value>(output).ok()?;
-    let objects = objects.as_array()?;
-
-    Some(
-        objects
-            .iter()
-            .filter_map(parse_pw_dump_bluetooth_card)
-            .collect(),
-    )
-}
-
-fn parse_pw_dump_bluetooth_card(object: &Value) -> Option<BluetoothCard> {
-    if object.get("type")?.as_str()? != "PipeWire:Interface:Device" {
-        return None;
-    }
-
-    let id = object.get("id")?.as_u64()? as u32;
-    let props = object.pointer("/info/props")?.as_object()?;
-    if props.get("device.api")?.as_str()? != "bluez5" {
-        return None;
-    }
-
-    let name = props
-        .get("device.description")
-        .and_then(Value::as_str)
-        .or_else(|| props.get("device.nick").and_then(Value::as_str))
-        .or_else(|| props.get("device.name").and_then(Value::as_str))?
-        .to_string();
-    let address = props
-        .get("api.bluez5.address")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            props
-                .get("device.name")
-                .and_then(Value::as_str)
-                .and_then(extract_bluetooth_address)
-        })
-        .or_else(|| {
-            props
-                .get("object.path")
-                .and_then(Value::as_str)
-                .and_then(extract_bluetooth_address)
-        });
-    let active_profile_name = object
-        .pointer("/info/params/Profile/0/name")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let available_profiles = object
-        .pointer("/info/params/EnumProfile")
-        .and_then(Value::as_array)
-        .map(|profiles| {
-            profiles
-                .iter()
-                .filter_map(parse_profile_option)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    Some(BluetoothCard {
-        id,
-        address,
-        name,
-        active_profile_name,
-        available_profiles,
-    })
-}
-
-fn parse_profile_option(value: &Value) -> Option<BluetoothProfileOption> {
-    Some(BluetoothProfileOption {
-        index: value.get("index")?.as_u64()? as u32,
-        name: value.get("name")?.as_str()?.to_string(),
-    })
-}
-
-pub fn extract_bluetooth_address(input: &str) -> Option<String> {
-    let token = input
-        .split(|ch: char| !(ch.is_ascii_hexdigit() || ch == '_' || ch == ':'))
-        .find(|part| part.matches('_').count() == 5 || part.matches(':').count() == 5)?;
-    let normalized = token.replace('_', ":").to_ascii_uppercase();
-    if normalized.split(':').all(|part| part.len() == 2) {
-        Some(normalized)
-    } else {
-        None
-    }
-}
-
-fn card_matches_address(card: &BluetoothCard, address: &str) -> bool {
-    card.address
-        .as_deref()
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(address))
-}
-
 fn is_dummy_output_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("dummy output")
         || name.eq_ignore_ascii_case("auto_null")
         || name.contains("auto_null")
 }
 
-fn is_a2dp_profile_name(name: &str) -> bool {
-    matches!(name, "a2dp-sink" | "a2dp_sink")
-}
-
-fn profile_name_to_kind(name: &str) -> Option<BluetoothProfile> {
-    if is_a2dp_profile_name(name) {
-        Some(BluetoothProfile::Media)
-    } else if matches!(
-        name,
-        "headset-head-unit" | "handsfree-head-unit" | "hfp_hf" | "hsp_hs"
-    ) {
-        Some(BluetoothProfile::Call)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        extract_bluetooth_address, parse_pw_dump_bluetooth_cards, parse_wpctl_inspect,
-        parse_wpctl_setting_bool, parse_wpctl_status_defaults,
-    };
+    use super::{parse_wpctl_inspect, parse_wpctl_setting_bool, parse_wpctl_status_defaults};
 
     #[test]
     fn parses_best_available_pipewire_name() {
@@ -431,50 +204,5 @@ Settings
     fn parses_boolean_wpctl_setting() {
         assert_eq!(parse_wpctl_setting_bool("Value: true\n"), Some(true));
         assert_eq!(parse_wpctl_setting_bool("Value: false\n"), Some(false));
-    }
-
-    #[test]
-    fn extracts_bluetooth_address_from_pipewire_names() {
-        assert_eq!(
-            extract_bluetooth_address("bluez_card.5C_DC_49_92_D0_D8"),
-            Some("5C:DC:49:92:D0:D8".to_string())
-        );
-    }
-
-    #[test]
-    fn parses_bluetooth_cards_from_pw_dump() {
-        let output = r#"
-[
-  {
-    "id": 91,
-    "type": "PipeWire:Interface:Device",
-    "info": {
-      "props": {
-        "device.api": "bluez5",
-        "device.description": "Phone",
-        "device.name": "bluez_card.5C_DC_49_92_D0_D8",
-        "api.bluez5.address": "5C:DC:49:92:D0:D8"
-      },
-      "params": {
-        "Profile": [
-          { "index": 2, "name": "a2dp-sink" }
-        ],
-        "EnumProfile": [
-          { "index": 1, "name": "off" },
-          { "index": 2, "name": "a2dp-sink" },
-          { "index": 3, "name": "headset-head-unit" }
-        ]
-      }
-    }
-  }
-]
-"#;
-
-        let cards = parse_pw_dump_bluetooth_cards(output).unwrap();
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].id, 91);
-        assert_eq!(cards[0].address.as_deref(), Some("5C:DC:49:92:D0:D8"));
-        assert_eq!(cards[0].active_profile_name.as_deref(), Some("a2dp-sink"));
-        assert_eq!(cards[0].available_profiles.len(), 3);
     }
 }

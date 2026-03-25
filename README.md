@@ -1,6 +1,6 @@
 # Orators
 
-`orators` turns a Linux desktop into a Bluetooth audio target. The current MVP direction is a safe control-only daemon: BlueZ for pairing and trusted-device management, PipeWire for local playback, and no WirePlumber or PipeWire policy mutation.
+`orators` turns a Linux desktop into a Bluetooth audio target. The current MVP direction is an app-owned Bluetooth media backend: BlueZ for pairing and trusted-device management, an Orators-managed A2DP sink endpoint, and a managed host install that keeps the desktop audio session on the normal non-Bluetooth profile.
 
 ## Scope
 
@@ -8,12 +8,13 @@
 - Rust workspace with a long-lived daemon and a CLI client
 - D-Bus control API on the user session bus
 - BlueZ pairing and trusted-device control
-- No WirePlumber fragment writes, no saved `wpctl` settings, and no session-manager overrides
+- Managed host backend install for the user-session WirePlumber audio profile
+- No ad hoc PipeWire config writes or runtime `wpctl` Bluetooth hacks
 
 ## Workspace
 
 - `crates/orators-core`: domain types, config, diagnostics, state machine
-- `crates/orators-linux`: Linux integrations for BlueZ, PipeWire, and systemd user services
+- `crates/orators-linux`: Linux integrations for BlueZ, PipeWire, the app-owned Bluetooth backend, and systemd user services
 - `crates/orators`: publishable crate with `oratorsd` and `oratorsctl`
 
 ## Local Development
@@ -35,14 +36,15 @@ nix flake check
 
 - `oratorsd` runs under `systemd --user`
 - `oratorsctl` talks to the daemon over the session bus
-- `oratorsctl install-user-service` installs the daemon unit
-- Orators does not write WirePlumber fragments or session-manager overrides. It does reapply runtime Bluetooth stability settings in the current session so Bluetooth devices stay on A2DP instead of drifting into headset mode.
+- `oratorsctl install-user-service` installs the daemon unit only
+- `oratorsctl install-host-backend` installs the daemon unit and the managed host backend drop-in
+- `oratorsctl uninstall-host-backend` removes the managed host backend drop-in
 
 ## Host Model
 
 - The user session must have a healthy PipeWire setup with a real default sink
 - The stock BlueZ system service must be healthy
-- Orators leaves the desktop audio session manager alone and only reads host state, but it does clear WirePlumber runtime Bluetooth settings that can drag devices back into headset mode
+- The managed host backend must be installed before pairing or connecting Bluetooth media devices
 
 ## Configuration
 
@@ -58,10 +60,11 @@ Legacy Bluetooth-mode fields are still ignored on load so existing configs remai
 
 ## Operational Notes
 
-1. Run `oratorsctl install-user-service` once to install the daemon unit.
-2. Run `oratorsctl doctor` before pairing or connecting a phone.
-3. If doctor reports that the host audio stack is unsupported or unhealthy, fix the host outside Orators first.
-4. Orators will not write WirePlumber fragments or other PipeWire session policy files, but it will keep the Bluetooth runtime settings pinned to the media-safe values for the current session.
+1. Run `oratorsctl install-host-backend` once to install the daemon unit and managed host backend.
+2. Restart `wireplumber.service` and `oratorsd.service` after installing the host backend.
+3. Run `oratorsctl doctor` before pairing or connecting a phone.
+4. If doctor reports that the host audio stack is unsupported or unhealthy, fix the host outside Orators first.
+5. Use `oratorsctl uninstall-host-backend` to remove the managed host backend and restore the stock session-manager behavior.
 
 ## License
 

@@ -1,16 +1,18 @@
 use anyhow::Result;
-use orators_core::{DiagnosticCheck, DiagnosticsReport, Severity};
+use orators_core::{DiagnosticCheck, DiagnosticsReport, MediaBackendStatus, MediaCodec, Severity};
 
 use crate::{
-    audio::{BluetoothCard, BluetoothRuntimeSettings, PipeWireDefaults, WpctlAudioRuntime},
+    audio::{PipeWireDefaults, WpctlAudioRuntime},
     bluez::{AdapterInfo, BluetoothCtlBluez},
-    systemd::{SystemdUserRuntime, UserServiceStatus},
+    owned_backend::OwnedBluetoothMediaBackend,
+    systemd::{SystemdUserRuntime, UserServiceStatus, service_uses_audio_profile},
 };
 
 pub async fn collect_report(
     bluez: &BluetoothCtlBluez,
     audio: &WpctlAudioRuntime,
     systemd: &SystemdUserRuntime,
+    owned_backend: &OwnedBluetoothMediaBackend,
 ) -> Result<DiagnosticsReport> {
     let mut checks = Vec::new();
 
@@ -49,36 +51,23 @@ pub async fn collect_report(
     };
 
     checks.push(media_role_check(adapter_info.as_ref()));
-    checks.push(call_roles_check(adapter_info.as_ref()));
 
     let wireplumber = systemd.service_status("wireplumber.service").await.ok();
+    let host_backend_installed = systemd.host_backend_installed().await.unwrap_or(false);
     checks.push(wireplumber_check(wireplumber.as_ref()));
 
     let defaults = audio.pipewire_defaults().await.ok();
     checks.push(pipewire_defaults_check(defaults.as_ref()));
 
-    let runtime_settings = audio.bluetooth_runtime_settings().await.ok();
-    checks.push(headset_autoswitch_check(runtime_settings.as_ref()));
-    checks.push(device_restore_profile_check(runtime_settings.as_ref()));
-    checks.push(bluetooth_persistent_storage_check(
-        runtime_settings.as_ref(),
-    ));
-
-    let bluetooth_cards = audio.bluetooth_cards().await.ok();
-    let active_device = bluez
-        .list_devices(true)
-        .await
-        .ok()
-        .and_then(|devices| devices.into_iter().find(|device| device.connected));
-    checks.push(active_profile_check(
-        active_device.as_ref().map(|device| device.address.as_str()),
-        bluetooth_cards.as_deref(),
-    ));
+    let backend = owned_backend.snapshot_status().await;
+    checks.push(owned_backend_check(&backend));
 
     checks.push(host_support_check(
         adapter_info.as_ref(),
         defaults.as_ref(),
         wireplumber.as_ref(),
+        host_backend_installed,
+        &backend,
     ));
 
     Ok(DiagnosticsReport {
@@ -97,54 +86,43 @@ fn media_role_check(adapter: Option<&AdapterInfo>) -> DiagnosticCheck {
             Severity::Error
         },
         summary: if supported {
-            "The stock Bluetooth stack advertises Audio Sink / A2DP media support".to_string()
+            "The Bluetooth controller advertises Audio Sink / A2DP media support".to_string()
         } else {
-            "The stock Bluetooth stack does not advertise Audio Sink / A2DP media support"
+            "The Bluetooth controller does not advertise Audio Sink / A2DP media support"
                 .to_string()
         },
         detail: adapter.map(|adapter| format!("Advertised adapter UUIDs: {}.", adapter.uuids.join(", "))),
         remediation: (!supported).then_some(
-            "Fix the host Bluetooth audio stack outside Orators before pairing or connecting media devices."
+            "Fix the host Bluetooth media support outside Orators before pairing or connecting media devices."
                 .to_string(),
         ),
-    }
-}
-
-fn call_roles_check(adapter: Option<&AdapterInfo>) -> DiagnosticCheck {
-    let exposed = adapter.is_some_and(adapter_exposes_call_roles);
-    DiagnosticCheck {
-        code: "bluez.call_roles".to_string(),
-        severity: Severity::Info,
-        summary: if exposed {
-            "The stock Bluetooth stack also advertises classic call roles".to_string()
-        } else {
-            "The stock Bluetooth stack is effectively media-only".to_string()
-        },
-        detail: Some(
-            "Orators does not manage or optimize call profiles. It only pins connected audio devices back to A2DP for speaker playback."
-                .to_string(),
-        ),
-        remediation: None,
     }
 }
 
 fn wireplumber_check(status: Option<&UserServiceStatus>) -> DiagnosticCheck {
     match status {
         Some(status) if status.active_state == "active" && status.sub_state == "running" => {
-            let detail = if status.restart_count > 0 {
-                format!(
-                    "wireplumber.service is active and running. Restart count since boot: {}.",
-                    status.restart_count
-                )
-            } else {
-                "wireplumber.service is active and running.".to_string()
-            };
             DiagnosticCheck {
                 code: "wireplumber.service".to_string(),
-                severity: Severity::Info,
-                summary: "WirePlumber is healthy".to_string(),
-                detail: Some(detail),
-                remediation: None,
+                severity: if service_uses_audio_profile(status) {
+                    Severity::Info
+                } else {
+                    Severity::Warn
+                },
+                summary: if service_uses_audio_profile(status) {
+                    "WirePlumber is healthy and running the managed audio profile".to_string()
+                } else {
+                    "WirePlumber is healthy but not running the managed audio profile".to_string()
+                },
+                detail: Some(format!(
+                    "wireplumber.service is active and running. Restart count since boot: {}. ExecStart: {}.",
+                    status.restart_count,
+                    status.exec_start.as_deref().unwrap_or("not detected")
+                )),
+                remediation: (!service_uses_audio_profile(status)).then_some(
+                    "Install the managed host backend with `oratorsctl install-host-backend` and restart the user audio services."
+                        .to_string(),
+                ),
             }
         }
         Some(status) => DiagnosticCheck {
@@ -221,217 +199,23 @@ fn pipewire_defaults_check(defaults: Option<&PipeWireDefaults>) -> DiagnosticChe
     }
 }
 
-fn headset_autoswitch_check(settings: Option<&BluetoothRuntimeSettings>) -> DiagnosticCheck {
-    match settings.and_then(|settings| settings.headset_autoswitch) {
-        Some(false) => DiagnosticCheck {
-            code: "wireplumber.bluetooth_autoswitch".to_string(),
-            severity: Severity::Info,
-            summary: "Bluetooth headset autoswitch is disabled at runtime".to_string(),
-            detail: Some(
-                "This host stays on the high-quality A2DP media profile instead of switching Bluetooth devices into headset mode when a recording stream appears."
-                    .to_string(),
-            ),
-            remediation: None,
-        },
-        Some(true) => DiagnosticCheck {
-            code: "wireplumber.bluetooth_autoswitch".to_string(),
-            severity: Severity::Warn,
-            summary: "Bluetooth headset autoswitch is enabled at runtime".to_string(),
-            detail: Some(
-                "On WirePlumber 0.5.x, automatic headset-profile switching can destabilize media-only Bluetooth speaker use."
-                    .to_string(),
-            ),
-            remediation: Some(
-                "If this host starts switching profiles on its own, disable the setting in WirePlumber outside Orators."
-                    .to_string(),
-            ),
-        },
-        None => DiagnosticCheck {
-            code: "wireplumber.bluetooth_autoswitch".to_string(),
-            severity: Severity::Warn,
-            summary: "Bluetooth headset autoswitch state could not be inspected".to_string(),
-            detail: Some(
-                "wpctl could not read the `bluetooth.autoswitch-to-headset-profile` runtime setting."
-                    .to_string(),
-            ),
-            remediation: Some(
-                "Make sure WirePlumber is healthy before using Orators with Bluetooth audio."
-                    .to_string(),
-            ),
-        },
-    }
-}
-
-fn device_restore_profile_check(settings: Option<&BluetoothRuntimeSettings>) -> DiagnosticCheck {
-    match settings.and_then(|settings| settings.device_restore_profile) {
-        Some(false) => DiagnosticCheck {
-            code: "wireplumber.device_restore_profile".to_string(),
-            severity: Severity::Info,
-            summary: "Bluetooth profile restore is disabled at runtime".to_string(),
-            detail: Some(
-                "WirePlumber will not restore a previous headset profile for Bluetooth devices, which keeps the Fold7 on the stable media profile instead of drifting back to audio-gateway."
-                    .to_string(),
-            ),
-            remediation: None,
-        },
-        Some(true) => DiagnosticCheck {
-            code: "wireplumber.device_restore_profile".to_string(),
-            severity: Severity::Warn,
-            summary: "Bluetooth profile restore is enabled at runtime".to_string(),
-            detail: Some(
-                "WirePlumber may restore a previously selected headset profile on reconnect, which can drag media-only devices back into the wrong Bluetooth mode."
-                    .to_string(),
-            ),
-            remediation: Some(
-                "If Bluetooth devices keep reconnecting in the wrong profile, disable profile restore at runtime."
-                    .to_string(),
-            ),
-        },
-        None => DiagnosticCheck {
-            code: "wireplumber.device_restore_profile".to_string(),
-            severity: Severity::Warn,
-            summary: "Bluetooth profile restore state could not be inspected".to_string(),
-            detail: Some(
-                "wpctl could not read the `device.restore-profile` runtime setting.".to_string(),
-            ),
-            remediation: Some(
-                "Make sure WirePlumber is healthy before using Orators with Bluetooth audio."
-                    .to_string(),
-            ),
-        },
-    }
-}
-
-fn bluetooth_persistent_storage_check(
-    settings: Option<&BluetoothRuntimeSettings>,
-) -> DiagnosticCheck {
-    match settings.and_then(|settings| settings.bluetooth_persistent_storage) {
-        Some(false) => DiagnosticCheck {
-            code: "wireplumber.bluetooth_persistent_storage".to_string(),
-            severity: Severity::Info,
-            summary: "Bluetooth persistent storage is disabled at runtime".to_string(),
-            detail: Some(
-                "WirePlumber will not reuse saved Bluetooth state for reconnects, which avoids replaying stale headset selections on this host."
-                    .to_string(),
-            ),
-            remediation: None,
-        },
-        Some(true) => DiagnosticCheck {
-            code: "wireplumber.bluetooth_persistent_storage".to_string(),
-            severity: Severity::Warn,
-            summary: "Bluetooth persistent storage is enabled at runtime".to_string(),
-            detail: Some(
-                "Saved Bluetooth state can bring back a previously unstable profile choice when the device reconnects."
-                    .to_string(),
-            ),
-            remediation: Some(
-                "If the Bluetooth profile keeps drifting after reconnects, disable persistent storage at runtime."
-                    .to_string(),
-            ),
-        },
-        None => DiagnosticCheck {
-            code: "wireplumber.bluetooth_persistent_storage".to_string(),
-            severity: Severity::Warn,
-            summary: "Bluetooth persistent storage state could not be inspected".to_string(),
-            detail: Some(
-                "wpctl could not read the `bluetooth.use-persistent-storage` runtime setting."
-                    .to_string(),
-            ),
-            remediation: Some(
-                "Make sure WirePlumber is healthy before using Orators with Bluetooth audio."
-                    .to_string(),
-            ),
-        },
-    }
-}
-
-fn active_profile_check(
-    active_device_address: Option<&str>,
-    cards: Option<&[BluetoothCard]>,
-) -> DiagnosticCheck {
-    let Some(address) = active_device_address else {
-        return DiagnosticCheck {
-            code: "bluetooth.a2dp_pin".to_string(),
-            severity: Severity::Info,
-            summary: "No active Bluetooth audio device is connected".to_string(),
-            detail: Some(
-                "Orators will pin the active Bluetooth card to A2DP only while a device is connected."
-                    .to_string(),
-            ),
-            remediation: None,
-        };
-    };
-
-    let Some(card) = cards.and_then(|cards| {
-        cards.iter().find(|card| {
-            card.address
-                .as_deref()
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(address))
-        })
-    }) else {
-        return DiagnosticCheck {
-            code: "bluetooth.a2dp_pin".to_string(),
-            severity: Severity::Warn,
-            summary:
-                "A Bluetooth device is connected, but PipeWire has no matching Bluetooth audio card yet"
-                    .to_string(),
-            detail: Some(format!("Connected device address: {address}.")),
-            remediation: Some(
-                "If playback does not appear within a few seconds, disconnect and reconnect the device."
-                    .to_string(),
-            ),
-        };
-    };
-
-    match card.active_profile_name.as_deref() {
-        Some("a2dp-sink") => DiagnosticCheck {
-            code: "bluetooth.a2dp_pin".to_string(),
-            severity: Severity::Info,
-            summary: "The active Bluetooth audio card is pinned to A2DP".to_string(),
-            detail: Some(format!(
-                "Connected device {address} maps to PipeWire card {}.",
-                card.name
-            )),
-            remediation: None,
-        },
-        Some(profile) => DiagnosticCheck {
-            code: "bluetooth.a2dp_pin".to_string(),
-            severity: Severity::Warn,
-            summary: "The active Bluetooth audio card drifted away from A2DP".to_string(),
-            detail: Some(format!(
-                "Connected device {address} is currently on profile `{profile}`."
-            )),
-            remediation: Some(
-                "Disconnect and reconnect the device if media playback does not return to A2DP on its own."
-                    .to_string(),
-            ),
-        },
-        None => DiagnosticCheck {
-            code: "bluetooth.a2dp_pin".to_string(),
-            severity: Severity::Warn,
-            summary: "The active Bluetooth audio card has no explicit profile selected".to_string(),
-            detail: Some(format!(
-                "Connected device {address} maps to PipeWire card {}.",
-                card.name
-            )),
-            remediation: Some(
-                "Reconnect the device if playback does not settle on A2DP within a few seconds."
-                    .to_string(),
-            ),
-        },
-    }
-}
-
 fn host_support_check(
     adapter: Option<&AdapterInfo>,
     defaults: Option<&PipeWireDefaults>,
     wireplumber: Option<&UserServiceStatus>,
+    host_backend_installed: bool,
+    backend: &MediaBackendStatus,
 ) -> DiagnosticCheck {
     let ready = adapter.is_some_and(adapter_supports_media)
         && defaults
             .is_some_and(|defaults| defaults.output_device.is_some() && !defaults.output_is_dummy)
-        && wireplumber
-            .is_some_and(|status| status.active_state == "active" && status.sub_state == "running");
+        && wireplumber.is_some_and(|status| {
+            status.active_state == "active"
+                && status.sub_state == "running"
+                && service_uses_audio_profile(status)
+        })
+        && host_backend_installed
+        && backend.endpoints_registered;
 
     DiagnosticCheck {
         code: "host.media_support".to_string(),
@@ -441,18 +225,76 @@ fn host_support_check(
             Severity::Error
         },
         summary: if ready {
-            "This host is ready for config-free Bluetooth speaker playback".to_string()
+            "This host is ready for the app-owned Bluetooth media backend".to_string()
         } else {
-            "This host is not ready for config-free Bluetooth speaker playback".to_string()
+            "This host is not ready for the app-owned Bluetooth media backend".to_string()
         },
         detail: Some(
-            "Orators now stays out of PipeWire/WirePlumber Bluetooth ownership and only checks the host audio session read-only."
+            "Orators owns the Bluetooth media endpoint itself and only depends on the host for a healthy PipeWire output path."
                 .to_string(),
         ),
         remediation: (!ready).then_some(
-            "Fix the host audio stack first. Orators will refuse pairing or connection attempts on unsupported or unhealthy hosts."
+            "Install the managed host backend with `oratorsctl install-host-backend`, make sure WirePlumber and PipeWire are healthy, and then retry pairing."
                 .to_string(),
         ),
+    }
+}
+
+fn owned_backend_check(backend: &MediaBackendStatus) -> DiagnosticCheck {
+    match (backend.endpoints_registered, backend.last_error.as_ref()) {
+        (false, _) => DiagnosticCheck {
+            code: "orators.owned_backend".to_string(),
+            severity: Severity::Error,
+            summary: "Orators' BlueZ media endpoints are not registered".to_string(),
+            detail: Some(
+                "The app-owned Bluetooth backend has not finished registering its A2DP sink endpoints."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "Restart oratorsd after installing the managed host backend, then retry pairing."
+                    .to_string(),
+            ),
+        },
+        (true, Some(error)) => DiagnosticCheck {
+            code: "orators.owned_backend".to_string(),
+            severity: Severity::Warn,
+            summary: "Orators' owned Bluetooth backend recorded a transport error".to_string(),
+            detail: Some(format!(
+                "Active codec: {}. Transport acquired: {}. Playback connected: {}. Last error: {}.",
+                media_codec_label(backend.active_codec.as_ref()),
+                backend.transport_acquired,
+                backend.playback_connected,
+                error
+            )),
+            remediation: Some(
+                "Disconnect the device, restart oratorsd, and retry pairing if the transport does not recover."
+                    .to_string(),
+            ),
+        },
+        (true, None) if backend.playback_connected => DiagnosticCheck {
+            code: "orators.owned_backend".to_string(),
+            severity: Severity::Info,
+            summary: "Orators' owned Bluetooth media backend is active".to_string(),
+            detail: Some(format!(
+                "Active codec: {}. Transport acquired: {}. Playback connected: {}.",
+                media_codec_label(backend.active_codec.as_ref()),
+                backend.transport_acquired,
+                backend.playback_connected
+            )),
+            remediation: None,
+        },
+        (true, None) => DiagnosticCheck {
+            code: "orators.owned_backend".to_string(),
+            severity: Severity::Info,
+            summary: "Orators' BlueZ media endpoints are registered and waiting for a device".to_string(),
+            detail: Some(format!(
+                "Active codec: {}. Transport acquired: {}. Playback connected: {}.",
+                media_codec_label(backend.active_codec.as_ref()),
+                backend.transport_acquired,
+                backend.playback_connected
+            )),
+            remediation: None,
+        },
     }
 }
 
@@ -482,14 +324,10 @@ fn adapter_supports_media(adapter: &AdapterInfo) -> bool {
     })
 }
 
-fn adapter_exposes_call_roles(adapter: &AdapterInfo) -> bool {
-    adapter.uuids.iter().any(|uuid| {
-        matches!(
-            uuid.to_ascii_lowercase().as_str(),
-            "00001108-0000-1000-8000-00805f9b34fb"
-                | "00001112-0000-1000-8000-00805f9b34fb"
-                | "0000111e-0000-1000-8000-00805f9b34fb"
-                | "0000111f-0000-1000-8000-00805f9b34fb"
-        )
-    })
+fn media_codec_label(codec: Option<&MediaCodec>) -> &'static str {
+    match codec {
+        Some(MediaCodec::Sbc) => "sbc",
+        Some(MediaCodec::Aac) => "aac",
+        None => "none",
+    }
 }

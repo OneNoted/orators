@@ -398,10 +398,7 @@ mod tests {
             Ok(AudioDefaults {
                 output_device: Some("Speakers".to_string()),
                 input_device: Some("Microphone".to_string()),
-                bluetooth_audio_supported: true,
-                call_roles_detected: false,
-                active_bluetooth_profile: None,
-                a2dp_pinned: true,
+                media_backend: Default::default(),
             })
         }
 

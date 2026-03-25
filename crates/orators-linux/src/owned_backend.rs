@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use orators_core::{MediaBackendStatus, MediaCodec};
 use tokio::sync::Mutex;
 use zbus::{
     Connection, DBusError, Proxy,
@@ -31,6 +32,15 @@ type ManagedObjects = HashMap<OwnedObjectPath, InterfaceProperties>;
 pub enum CodecKind {
     Sbc,
     Aac,
+}
+
+impl From<CodecKind> for MediaCodec {
+    fn from(value: CodecKind) -> Self {
+        match value {
+            CodecKind::Sbc => Self::Sbc,
+            CodecKind::Aac => Self::Aac,
+        }
+    }
 }
 
 impl CodecKind {
@@ -100,6 +110,18 @@ impl OwnedBackendState {
     }
 }
 
+impl From<OwnedBackendSnapshot> for MediaBackendStatus {
+    fn from(value: OwnedBackendSnapshot) -> Self {
+        Self {
+            endpoints_registered: value.endpoints_registered,
+            active_codec: value.active_codec.map(MediaCodec::from),
+            transport_acquired: value.transport_acquired,
+            playback_connected: value.playback_connected,
+            last_error: value.last_error,
+        }
+    }
+}
+
 struct TransportRecord {
     codec: CodecKind,
     worker: Option<TransportWorker>,
@@ -161,6 +183,10 @@ impl OwnedBluetoothMediaBackend {
 
     pub async fn snapshot(&self) -> OwnedBackendSnapshot {
         self.state.lock().await.snapshot()
+    }
+
+    pub async fn snapshot_status(&self) -> MediaBackendStatus {
+        self.snapshot().await.into()
     }
 
     async fn register_endpoints(&self) -> Result<()> {
@@ -613,12 +639,14 @@ fn select_aac_configuration(capabilities: &[u8]) -> Result<SelectedConfiguration
 
 #[cfg(test)]
 mod tests {
+    use orators_core::{MediaBackendStatus, MediaCodec};
+
     fn extract_device_address(path: &str) -> Option<String> {
         let suffix = path.split("/dev_").nth(1)?;
         Some(suffix.replace('_', ":"))
     }
 
-    use super::{CodecKind, extract_media_payload};
+    use super::{CodecKind, OwnedBackendSnapshot, extract_media_payload};
 
     #[test]
     fn extracts_device_address_from_bluez_path() {
@@ -646,5 +674,23 @@ mod tests {
             .collect::<Vec<_>>();
         let payload = extract_media_payload(CodecKind::Aac, &packet).unwrap();
         assert_eq!(payload, vec![0x56, 0xe0, 0x12, 0x34]);
+    }
+
+    #[test]
+    fn converts_owned_backend_snapshot_to_public_status() {
+        let snapshot = OwnedBackendSnapshot {
+            endpoints_registered: true,
+            active_codec: Some(CodecKind::Aac),
+            transport_acquired: true,
+            playback_connected: false,
+            last_error: Some("boom".to_string()),
+        };
+
+        let status: MediaBackendStatus = snapshot.into();
+        assert!(status.endpoints_registered);
+        assert_eq!(status.active_codec, Some(MediaCodec::Aac));
+        assert!(status.transport_acquired);
+        assert!(!status.playback_connected);
+        assert_eq!(status.last_error.as_deref(), Some("boom"));
     }
 }

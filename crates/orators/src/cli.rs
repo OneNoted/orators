@@ -31,6 +31,8 @@ pub enum Command {
     Disconnect,
     Doctor,
     InstallUserService,
+    InstallHostBackend,
+    UninstallHostBackend,
 }
 
 #[derive(Debug, Args)]
@@ -66,6 +68,8 @@ pub enum DeviceCommand {
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::InstallUserService => install_user_service(cli.json).await,
+        Command::InstallHostBackend => install_host_backend(cli.json).await,
+        Command::UninstallHostBackend => uninstall_host_backend(cli.json).await,
         Command::Doctor => run_doctor(cli.json).await,
         command => run_daemon_command(command, cli.json).await,
     }
@@ -146,7 +150,10 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
             let output = client.disconnect_active().await?;
             render_status_output(output, json, "Disconnect request sent.")?;
         }
-        Command::Doctor | Command::InstallUserService => unreachable!(),
+        Command::Doctor
+        | Command::InstallUserService
+        | Command::InstallHostBackend
+        | Command::UninstallHostBackend => unreachable!(),
     }
     Ok(())
 }
@@ -175,6 +182,50 @@ async fn install_user_service(json: bool) -> Result<()> {
     } else {
         println!("Installed user service at {}.", unit_path.display());
         println!("This only installs the daemon unit.");
+    }
+    Ok(())
+}
+
+async fn install_host_backend(json: bool) -> Result<()> {
+    let config_path = default_config_path()?;
+    ensure_config_exists(&config_path)?;
+    let daemon_path = resolve_daemon_path()?;
+    let systemd = SystemdUserRuntime;
+    let (unit_path, dropin_path) = systemd.install_host_backend(&daemon_path).await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "unit_path": unit_path.display().to_string(),
+                "wireplumber_dropin": dropin_path.display().to_string(),
+            })
+        );
+    } else {
+        println!("Installed user service at {}.", unit_path.display());
+        println!(
+            "Installed managed host backend drop-in at {}.",
+            dropin_path.display()
+        );
+        println!("Restart WirePlumber and the Orators daemon to activate the backend.");
+    }
+    Ok(())
+}
+
+async fn uninstall_host_backend(json: bool) -> Result<()> {
+    let systemd = SystemdUserRuntime;
+    let removed = systemd.uninstall_host_backend().await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "removed": removed,
+            })
+        );
+    } else if removed {
+        println!("Removed the managed host backend drop-in.");
+    } else {
+        println!("No managed host backend drop-in was present.");
     }
     Ok(())
 }
@@ -316,23 +367,33 @@ fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&Diagnostics
             .unwrap_or("not detected")
     );
     println!(
-        "Bluetooth speaker support: {}",
-        yes_no(status.audio.bluetooth_audio_supported),
+        "Orators Bluetooth endpoints registered: {}",
+        yes_no(status.audio.media_backend.endpoints_registered),
     );
     println!(
-        "Extra call roles on host: {}",
-        yes_no(status.audio.call_roles_detected),
-    );
-    println!(
-        "Active Bluetooth profile: {}",
+        "Active Bluetooth codec: {}",
         status
             .audio
-            .active_bluetooth_profile
+            .media_backend
+            .active_codec
             .as_ref()
-            .map(profile_label)
+            .map(|codec| match codec {
+                orators_core::MediaCodec::Sbc => "sbc",
+                orators_core::MediaCodec::Aac => "aac",
+            })
             .unwrap_or("none"),
     );
-    println!("A2DP pinned: {}", yes_no(status.audio.a2dp_pinned));
+    println!(
+        "Transport acquired: {}",
+        yes_no(status.audio.media_backend.transport_acquired),
+    );
+    println!(
+        "Playback connected: {}",
+        yes_no(status.audio.media_backend.playback_connected),
+    );
+    if let Some(error) = &status.audio.media_backend.last_error {
+        println!("Last backend error: {error}");
+    }
     if let Some(summary) = diagnostics.and_then(host_support_summary) {
         println!("Host readiness: {summary}");
     }

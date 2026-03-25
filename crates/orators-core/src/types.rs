@@ -2,9 +2,25 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum MediaCodec {
+    Sbc,
+    Aac,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum BluetoothProfile {
     Media,
     Call,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaBackendStatus {
+    pub endpoints_registered: bool,
+    pub active_codec: Option<MediaCodec>,
+    pub transport_acquired: bool,
+    pub playback_connected: bool,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,10 +38,7 @@ pub struct DeviceInfo {
 pub struct AudioDefaults {
     pub output_device: Option<String>,
     pub input_device: Option<String>,
-    pub bluetooth_audio_supported: bool,
-    pub call_roles_detected: bool,
-    pub active_bluetooth_profile: Option<BluetoothProfile>,
-    pub a2dp_pinned: bool,
+    pub media_backend: MediaBackendStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

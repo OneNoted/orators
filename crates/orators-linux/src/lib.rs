@@ -1,21 +1,24 @@
 pub mod audio;
 pub mod bluez;
 pub mod diagnostics;
+pub mod owned_backend;
 pub mod systemd;
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use orators_core::{AudioDefaults, DeviceInfo, DiagnosticsReport, OratorsConfig};
+use orators_core::{AudioDefaults, BluetoothProfile, DeviceInfo, DiagnosticsReport, OratorsConfig};
 
 use crate::{
     audio::WpctlAudioRuntime, bluez::BluetoothCtlBluez, diagnostics::collect_report,
-    systemd::SystemdUserRuntime,
+    owned_backend::OwnedBluetoothMediaBackend, systemd::SystemdUserRuntime,
+    systemd::service_uses_audio_profile,
 };
 
 pub struct LinuxPlatform {
     bluez: BluetoothCtlBluez,
     audio: WpctlAudioRuntime,
+    owned_backend: OwnedBluetoothMediaBackend,
     systemd: SystemdUserRuntime,
     config: OratorsConfig,
 }
@@ -23,22 +26,24 @@ pub struct LinuxPlatform {
 impl LinuxPlatform {
     pub async fn new(config: OratorsConfig) -> Result<Self> {
         let systemd = SystemdUserRuntime;
-        if let Err(error) = systemd.cleanup_legacy_wireplumber_dropin().await {
-            tracing::warn!(
-                ?error,
-                "failed to clean up legacy WirePlumber Bluetooth ownership state"
-            );
-        }
         Ok(Self {
             bluez: BluetoothCtlBluez::new().await?,
             audio: WpctlAudioRuntime,
+            owned_backend: OwnedBluetoothMediaBackend::new().await?,
             systemd,
             config,
         })
     }
 
     pub async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
-        self.bluez.list_devices(self.config.auto_reconnect).await
+        let mut devices = self.bluez.list_devices(self.config.auto_reconnect).await?;
+        let backend = self.owned_backend.snapshot_status().await;
+        if backend.playback_connected {
+            for device in devices.iter_mut().filter(|device| device.connected) {
+                device.active_profile = Some(BluetoothProfile::Media);
+            }
+        }
+        Ok(devices)
     }
 
     pub async fn start_pairing(&self, timeout_secs: u64) -> Result<()> {
@@ -72,40 +77,39 @@ impl LinuxPlatform {
     }
 
     pub async fn current_audio_defaults(&self) -> Result<AudioDefaults> {
-        let adapter = self.bluez.adapter_info().await.ok();
-        let active_device = self
-            .bluez
-            .list_devices(self.config.auto_reconnect)
-            .await
-            .ok()
-            .and_then(|devices| devices.into_iter().find(|device| device.connected))
-            .map(|device| device.address);
-
-        let defaults = self
-            .audio
-            .current_defaults(
-                adapter.as_ref().is_some_and(adapter_supports_media),
-                adapter.as_ref().is_some_and(adapter_exposes_call_roles),
-                active_device.as_deref(),
-            )
-            .await?;
-        Ok(defaults)
+        let backend = self.owned_backend.snapshot_status().await;
+        let defaults = self.audio.current_defaults().await?;
+        Ok(AudioDefaults {
+            output_device: defaults.output_device,
+            input_device: defaults.input_device,
+            media_backend: backend,
+        })
     }
 
     pub async fn ensure_host_media_ready(&self) -> Result<()> {
         let adapter = self.bluez.adapter_info().await?;
         if !adapter_supports_media(&adapter) {
             anyhow::bail!(
-                "the stock Bluetooth stack does not advertise Audio Sink / A2DP media support"
+                "the Bluetooth controller does not advertise Audio Sink / A2DP media support"
+            );
+        }
+
+        if !self.systemd.host_backend_installed().await? {
+            anyhow::bail!(
+                "Orators' managed host backend is not installed; run `oratorsctl install-host-backend` first"
             );
         }
 
         let wireplumber = self.systemd.service_status("wireplumber.service").await?;
-        if wireplumber.active_state != "active" || wireplumber.sub_state != "running" {
+        if wireplumber.active_state != "active"
+            || wireplumber.sub_state != "running"
+            || !service_uses_audio_profile(&wireplumber)
+        {
             anyhow::bail!(
-                "wireplumber.service is not healthy: ActiveState={}, SubState={}",
+                "wireplumber.service is not running the managed audio profile: ActiveState={}, SubState={}, ExecStart={}",
                 wireplumber.active_state,
-                wireplumber.sub_state
+                wireplumber.sub_state,
+                wireplumber.exec_start.as_deref().unwrap_or("not detected")
             );
         }
 
@@ -114,17 +118,23 @@ impl LinuxPlatform {
             anyhow::bail!("PipeWire does not currently have a usable default sink");
         }
 
-        self.audio.apply_media_stability_settings().await?;
+        let backend = self.owned_backend.snapshot_status().await;
+        if !backend.endpoints_registered {
+            anyhow::bail!("Orators' BlueZ media endpoints are not registered");
+        }
 
         Ok(())
     }
 
     pub async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()> {
         if active_device.is_some() {
-            let wireplumber = self.systemd.service_status("wireplumber.service").await?;
-            if wireplumber.active_state != "active" || wireplumber.sub_state != "running" {
+            let backend = self.owned_backend.snapshot_status().await;
+            if !backend.endpoints_registered {
+                anyhow::bail!("Orators' BlueZ media endpoints are not registered");
+            }
+            if backend.last_error.is_some() {
                 anyhow::bail!(
-                    "wireplumber.service became unhealthy while Bluetooth audio was active"
+                    "Orators' owned Bluetooth backend reported an error while audio was active"
                 );
             }
             let defaults = self.audio.pipewire_defaults().await?;
@@ -139,7 +149,7 @@ impl LinuxPlatform {
     }
 
     pub async fn diagnostics(&self) -> Result<DiagnosticsReport> {
-        collect_report(&self.bluez, &self.audio, &self.systemd).await
+        collect_report(&self.bluez, &self.audio, &self.systemd, &self.owned_backend).await
     }
 
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {
@@ -158,17 +168,5 @@ fn adapter_supports_media(adapter: &crate::bluez::AdapterInfo) -> bool {
     adapter.uuids.iter().any(|uuid| {
         uuid.eq_ignore_ascii_case("0000110b-0000-1000-8000-00805f9b34fb")
             || uuid.eq_ignore_ascii_case("0000110d-0000-1000-8000-00805f9b34fb")
-    })
-}
-
-fn adapter_exposes_call_roles(adapter: &crate::bluez::AdapterInfo) -> bool {
-    adapter.uuids.iter().any(|uuid| {
-        matches!(
-            uuid.to_ascii_lowercase().as_str(),
-            "00001108-0000-1000-8000-00805f9b34fb"
-                | "00001112-0000-1000-8000-00805f9b34fb"
-                | "0000111e-0000-1000-8000-00805f9b34fb"
-                | "0000111f-0000-1000-8000-00805f9b34fb"
-        )
     })
 }
