@@ -34,22 +34,16 @@ impl BluealsaAssets {
             });
         }
 
-        for dir in PACKAGED_BLUEALSA_DIRS {
-            let dir = Path::new(dir);
-            if dir.exists() {
-                return Self::discover_in_dir(dir).with_context(|| {
-                    format!(
-                        "failed to discover packaged BlueALSA assets in {}",
-                        dir.display()
-                    )
-                });
-            }
-        }
+        let packaged_error = Self::discover_in_packaged_dirs(PACKAGED_BLUEALSA_DIRS.iter().map(Path::new)).err();
 
-        Self::discover_in_path(
-            &env::var_os("PATH").context("failed to find BlueALSA assets in PATH")?,
-        )
-        .context("failed to find `bluealsad`, `bluealsa-aplay`, and `bluealsactl` in PATH")
+        let path = env::var_os("PATH").context("failed to find BlueALSA assets in PATH")?;
+        Self::discover_in_path(&path).map_err(|path_error| {
+            packaged_error.unwrap_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to find `bluealsad`, `bluealsa-aplay`, and `bluealsactl` in PATH: {path_error}"
+                )
+            })
+        })
     }
 
     fn discover_in_path(path: &OsStr) -> Result<Self> {
@@ -76,6 +70,32 @@ impl BluealsaAssets {
             Ok(assets)
         } else {
             anyhow::bail!("one or more BlueALSA binaries are missing or not executable");
+        }
+    }
+
+    fn discover_in_packaged_dirs<'a>(
+        dirs: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<Self> {
+        let mut packaged_error = None;
+        for dir in dirs {
+            if dir.exists() {
+                match Self::discover_in_dir(dir) {
+                    Ok(assets) => return Ok(assets),
+                    Err(error) => {
+                        packaged_error = Some(anyhow::anyhow!(
+                            "failed to discover packaged BlueALSA assets in {}: {error}",
+                            dir.display()
+                        ));
+                    }
+                }
+            }
+        }
+
+        match packaged_error {
+            Some(error) => Err(error),
+            None => Err(anyhow::anyhow!(
+                "no packaged BlueALSA asset directories were found"
+            )),
         }
     }
 }
@@ -282,10 +302,23 @@ fn find_binary_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .file_name()
-            .is_some_and(|name| name != OsStr::new("") && std::fs::metadata(path).is_ok())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        path.is_file()
+            && path.file_name().is_some_and(|name| name != OsStr::new(""))
+            && std::fs::metadata(path)
+                .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+            && path.file_name().is_some_and(|name| name != OsStr::new(""))
+            && std::fs::metadata(path).is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -326,5 +359,37 @@ mod tests {
         assert!(assets.bluealsad.ends_with("bluealsad"));
         assert!(assets.bluealsa_aplay.ends_with("bluealsa-aplay"));
         assert!(assets.bluealsactl.ends_with("bluealsactl"));
+    }
+
+    #[test]
+    fn ignores_non_executable_files() {
+        let dir = tempdir().unwrap();
+        let binary = dir.path().join("bluealsad");
+        fs::write(&binary, "#!/bin/sh\n").unwrap();
+        let found = find_binary_in_path("bluealsad", dir.path().as_os_str());
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn packaged_dir_discovery_falls_through_invalid_dir() {
+        let invalid_dir = tempdir().unwrap();
+        fs::write(invalid_dir.path().join("bluealsad"), "#!/bin/sh\n").unwrap();
+
+        let valid_dir = tempdir().unwrap();
+        for name in ["bluealsad", "bluealsa-aplay", "bluealsactl"] {
+            let binary = valid_dir.path().join(name);
+            fs::write(&binary, "#!/bin/sh\n").unwrap();
+            let mut permissions = fs::metadata(&binary).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary, permissions).unwrap();
+        }
+
+        let assets = BluealsaAssets::discover_in_packaged_dirs([
+            invalid_dir.path(),
+            valid_dir.path(),
+        ])
+        .unwrap();
+
+        assert!(assets.bluealsad.starts_with(valid_dir.path()));
     }
 }

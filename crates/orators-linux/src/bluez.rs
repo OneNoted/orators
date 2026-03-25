@@ -400,7 +400,7 @@ impl BluetoothCtlBluez {
     fn path_matches_preferred_adapter(&self, path: &OwnedObjectPath) -> bool {
         self.preferred_adapter
             .as_deref()
-            .is_none_or(|adapter| path.as_str().contains(&format!("/{adapter}")))
+            .is_none_or(|adapter| path_has_adapter_segment(path.as_str(), adapter))
     }
 }
 
@@ -666,7 +666,7 @@ fn parse_remote_devices(
     managed
         .iter()
         .filter(|(path, _)| {
-            preferred_adapter.is_none_or(|adapter| path.as_str().contains(&format!("/{adapter}/")))
+            preferred_adapter.is_none_or(|adapter| path_has_adapter_segment(path.as_str(), adapter))
         })
         .filter_map(|(_, interfaces)| interfaces.get("org.bluez.Device1"))
         .filter_map(|properties| {
@@ -690,6 +690,13 @@ fn adapter_id_from_path(path: &OwnedObjectPath) -> String {
         .to_string()
 }
 
+fn path_has_adapter_segment(path: &str, adapter: &str) -> bool {
+    let mut segments = path.trim_matches('/').split('/');
+    matches!(segments.next(), Some("org"))
+        && matches!(segments.next(), Some("bluez"))
+        && matches!(segments.next(), Some(segment) if segment == adapter)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -699,7 +706,7 @@ mod tests {
 
     use super::{
         A2DP_SOURCE_UUID, AdapterInfo, AgentError, DeviceAuthorizationState, RemoteDeviceInfo,
-        authorize_device_state, parse_device, parse_transport_profile,
+        authorize_device_state, parse_device, parse_transport_profile, path_has_adapter_segment,
         remote_device_supports_media,
     };
 
@@ -838,5 +845,17 @@ mod tests {
 
         assert!(remote_device_supports_media(&phone));
         assert!(!remote_device_supports_media(&keyboard));
+    }
+
+    #[test]
+    fn adapter_segment_match_is_exact() {
+        assert!(path_has_adapter_segment(
+            "/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF",
+            "hci1"
+        ));
+        assert!(!path_has_adapter_segment(
+            "/org/bluez/hci10/dev_AA_BB_CC_DD_EE_FF",
+            "hci1"
+        ));
     }
 }

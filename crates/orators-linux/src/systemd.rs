@@ -75,53 +75,62 @@ impl SystemdUserRuntime {
         )
         .await?;
         fs::write(&temp_policy_path, render_system_backend_dbus_policy()).await?;
-        self.run_sudo([
-            "install",
-            "-Dm644",
-            temp_unit_path.to_string_lossy().as_ref(),
-            system_unit_path.to_string_lossy().as_ref(),
-        ])
-        .await?;
-        self.run_sudo([
-            "install",
-            "-Dm644",
-            temp_policy_path.to_string_lossy().as_ref(),
-            dbus_policy_path.to_string_lossy().as_ref(),
-        ])
-        .await?;
+        let install_result = async {
+            self.run_sudo([
+                "install",
+                "-Dm644",
+                temp_unit_path.to_string_lossy().as_ref(),
+                system_unit_path.to_string_lossy().as_ref(),
+            ])
+            .await?;
+            self.run_sudo([
+                "install",
+                "-Dm644",
+                temp_policy_path.to_string_lossy().as_ref(),
+                dbus_policy_path.to_string_lossy().as_ref(),
+            ])
+            .await?;
+            self.run_sudo([
+                "rm",
+                "-f",
+                legacy_system_backend_unit_path().to_string_lossy().as_ref(),
+            ])
+            .await?;
+            self.run_sudo([
+                "busctl",
+                "call",
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "ReloadConfig",
+            ])
+            .await?;
+            self.run_sudo(["systemctl", "daemon-reload"]).await?;
+            self.run_sudo(["systemctl", "reset-failed", SYSTEM_BACKEND_UNIT])
+                .await?;
+            self.run_sudo(["systemctl", "enable", "--now", SYSTEM_BACKEND_UNIT])
+                .await?;
+            self.run_user_systemctl(["try-restart", "wireplumber.service"])
+                .await?;
+
+            Ok(SystemBackendInstallResult {
+                user_service_path: user_unit_path()?,
+                wireplumber_fragment_path: fragment_path.clone(),
+                dbus_policy_path: dbus_policy_path.clone(),
+                system_unit_path: system_unit_path.clone(),
+                adapter: adapter.to_string(),
+            })
+        }
+        .await;
+
         let _ = fs::remove_file(&temp_unit_path).await;
         let _ = fs::remove_file(&temp_policy_path).await;
 
-        self.run_sudo([
-            "rm",
-            "-f",
-            legacy_system_backend_unit_path().to_string_lossy().as_ref(),
-        ])
-        .await?;
-        self.run_sudo([
-            "busctl",
-            "call",
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "ReloadConfig",
-        ])
-        .await?;
-        self.run_sudo(["systemctl", "daemon-reload"]).await?;
-        self.run_sudo(["systemctl", "reset-failed", SYSTEM_BACKEND_UNIT])
-            .await?;
-        self.run_sudo(["systemctl", "enable", "--now", SYSTEM_BACKEND_UNIT])
-            .await?;
-        self.run_user_systemctl(["try-restart", "wireplumber.service"])
-            .await?;
+        if install_result.is_err() {
+            let _ = self.rollback_failed_install(&fragment_path).await;
+        }
 
-        Ok(SystemBackendInstallResult {
-            user_service_path: user_unit_path()?,
-            wireplumber_fragment_path: fragment_path,
-            dbus_policy_path,
-            system_unit_path,
-            adapter: adapter.to_string(),
-        })
+        install_result
     }
 
     pub async fn uninstall_system_backend(&self) -> Result<()> {
@@ -277,6 +286,43 @@ impl SystemdUserRuntime {
             );
         }
 
+        Ok(())
+    }
+
+    async fn rollback_failed_install(&self, fragment_path: &Path) -> Result<()> {
+        let _ = self
+            .run_sudo(["systemctl", "disable", "--now", SYSTEM_BACKEND_UNIT])
+            .await;
+        let _ = self
+            .run_sudo([
+                "rm",
+                "-f",
+                system_backend_unit_path().to_string_lossy().as_ref(),
+            ])
+            .await;
+        let _ = self
+            .run_sudo([
+                "rm",
+                "-f",
+                system_backend_dbus_policy_path().to_string_lossy().as_ref(),
+            ])
+            .await;
+        let _ = self
+            .run_sudo([
+                "busctl",
+                "call",
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "ReloadConfig",
+            ])
+            .await;
+        let _ = self.run_sudo(["systemctl", "daemon-reload"]).await;
+
+        if fragment_path.exists() {
+            let _ = fs::remove_file(fragment_path).await;
+        }
+        let _ = self.run_user_systemctl(["try-restart", "wireplumber.service"]).await;
         Ok(())
     }
 }
