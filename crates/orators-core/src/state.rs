@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use crate::{
     OratorsConfig,
     error::{OratorsError, Result},
-    types::{AudioDefaults, BluetoothProfile, DeviceInfo, PairingWindow, RuntimeStatus},
+    types::{
+        AudioDefaults, BluetoothProfile, DeviceInfo, MediaBackendStatus, PairingWindow,
+        RuntimeStatus,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -13,6 +16,7 @@ pub struct OratorsState {
     pairing_until_epoch_secs: Option<u64>,
     active_device: Option<String>,
     audio: AudioDefaults,
+    backend: MediaBackendStatus,
 }
 
 impl OratorsState {
@@ -23,6 +27,7 @@ impl OratorsState {
             pairing_until_epoch_secs: None,
             active_device: None,
             audio: AudioDefaults::default(),
+            backend: MediaBackendStatus::default(),
         }
     }
 
@@ -147,11 +152,27 @@ impl OratorsState {
             device.connected = false;
             device.active_profile = None;
         }
+        self.backend.active_device_address = None;
+        self.backend.player_running = false;
+        self.backend.player_state = crate::types::PlayerState::Waiting;
         Some(active)
     }
 
     pub fn update_audio(&mut self, audio: AudioDefaults) {
         self.audio = audio;
+    }
+
+    pub fn update_backend(&mut self, backend: MediaBackendStatus) {
+        self.active_device = backend.active_device_address.clone();
+        self.backend = backend;
+
+        for device in self.devices.values_mut() {
+            if self.active_device.as_deref() == Some(device.address.as_str()) {
+                device.active_profile = Some(BluetoothProfile::Media);
+            } else if matches!(device.active_profile, Some(BluetoothProfile::Media)) {
+                device.active_profile = None;
+            }
+        }
     }
 
     pub fn pairing_window(&self, now_epoch_secs: u64) -> PairingWindow {
@@ -171,6 +192,7 @@ impl OratorsState {
             active_device: self.active_device.clone(),
             devices: self.devices.values().cloned().collect(),
             audio: self.audio.clone(),
+            backend: self.backend.clone(),
         }
     }
 }

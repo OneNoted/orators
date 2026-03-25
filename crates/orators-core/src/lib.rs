@@ -9,4 +9,7 @@ pub use config::{OratorsConfig, normalize_device_address};
 pub use diagnostics::{DiagnosticCheck, DiagnosticsReport, Severity};
 pub use error::{OratorsError, Result};
 pub use state::OratorsState;
-pub use types::{AudioDefaults, BluetoothProfile, DeviceInfo, PairingWindow, RuntimeStatus};
+pub use types::{
+    AudioDefaults, BluetoothProfile, DeviceInfo, MediaBackendKind, MediaBackendStatus,
+    PairingWindow, PlayerState, RuntimeStatus,
+};

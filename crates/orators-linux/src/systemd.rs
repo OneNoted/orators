@@ -4,39 +4,138 @@ use anyhow::{Context, Result};
 use dirs::home_dir;
 use tokio::{fs, process::Command};
 
-const UNIT_NAME: &str = "oratorsd.service";
+use crate::bluealsa::{BluealsaAssets, SYSTEM_BACKEND_UNIT};
+
+const USER_UNIT_NAME: &str = "oratorsd.service";
+const BACKEND_FRAGMENT_NAME: &str = "90-orators-disable-bluez.conf";
 const LEGACY_WIREPLUMBER_DROPIN: &str = "90-orators-audio-owner.conf";
+const LEGACY_WIREPLUMBER_FRAGMENT: &str = "90-orators-bluetooth.conf";
+const LEGACY_SYSTEM_BACKEND_UNIT: &str = "orators-bluealsa.service";
+const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
 
 pub struct SystemdUserRuntime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserServiceStatus {
+pub struct ServiceStatus {
     pub active_state: String,
     pub sub_state: String,
     pub result: Option<String>,
     pub restart_count: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemBackendInstallResult {
+    pub user_service_path: PathBuf,
+    pub wireplumber_fragment_path: PathBuf,
+    pub system_unit_path: PathBuf,
+    pub adapter: String,
+}
+
 impl SystemdUserRuntime {
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {
-        self.cleanup_legacy_wireplumber_dropin().await?;
-        let unit_path = unit_path()?;
+        let unit_path = user_unit_path()?;
         if let Some(parent) = unit_path.parent() {
             fs::create_dir_all(parent).await?;
         }
 
-        fs::write(&unit_path, render_unit(daemon_path)).await?;
-        self.run_systemctl(["daemon-reload"]).await?;
+        fs::write(&unit_path, render_user_unit(daemon_path)).await?;
+        self.run_user_systemctl(["daemon-reload"]).await?;
 
         Ok(unit_path)
     }
 
     pub async fn start_orators_service(&self) -> Result<()> {
-        self.run_systemctl(["start", UNIT_NAME]).await
+        self.run_user_systemctl(["start", USER_UNIT_NAME]).await
     }
 
-    pub async fn try_restart(&self, unit_name: &str) -> Result<()> {
-        self.run_systemctl(["try-restart", unit_name]).await
+    pub async fn install_system_backend(
+        &self,
+        assets: &BluealsaAssets,
+        adapter: &str,
+    ) -> Result<SystemBackendInstallResult> {
+        self.cleanup_legacy_wireplumber_dropin().await?;
+        self.remove_legacy_fragment().await?;
+
+        let fragment_path = wireplumber_fragment_path()?;
+        if let Some(parent) = fragment_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(&fragment_path, render_wireplumber_fragment()).await?;
+
+        let system_unit_path = system_backend_unit_path();
+        let temp_unit_path = std::env::temp_dir().join("orators-bluealsad.service");
+        fs::write(
+            &temp_unit_path,
+            render_system_backend_unit(&assets.bluealsad, adapter),
+        )
+        .await?;
+        self.run_sudo([
+            "install",
+            "-Dm644",
+            temp_unit_path.to_string_lossy().as_ref(),
+            system_unit_path.to_string_lossy().as_ref(),
+        ])
+        .await?;
+        let _ = fs::remove_file(&temp_unit_path).await;
+
+        self.run_sudo([
+            "rm",
+            "-f",
+            legacy_system_backend_unit_path().to_string_lossy().as_ref(),
+        ])
+        .await?;
+        self.run_sudo(["systemctl", "daemon-reload"]).await?;
+        self.run_sudo(["systemctl", "enable", "--now", SYSTEM_BACKEND_UNIT])
+            .await?;
+        self.run_user_systemctl(["try-restart", "wireplumber.service"])
+            .await?;
+
+        Ok(SystemBackendInstallResult {
+            user_service_path: user_unit_path()?,
+            wireplumber_fragment_path: fragment_path,
+            system_unit_path,
+            adapter: adapter.to_string(),
+        })
+    }
+
+    pub async fn uninstall_system_backend(&self) -> Result<()> {
+        let _ = self
+            .run_sudo(["systemctl", "disable", "--now", SYSTEM_BACKEND_UNIT])
+            .await;
+        let _ = self
+            .run_sudo(["systemctl", "disable", "--now", LEGACY_SYSTEM_BACKEND_UNIT])
+            .await;
+        let _ = self
+            .run_sudo([
+                "rm",
+                "-f",
+                system_backend_unit_path().to_string_lossy().as_ref(),
+            ])
+            .await;
+        let _ = self
+            .run_sudo([
+                "rm",
+                "-f",
+                legacy_system_backend_unit_path().to_string_lossy().as_ref(),
+            ])
+            .await;
+        let _ = self.run_sudo(["systemctl", "daemon-reload"]).await;
+
+        let fragment_path = wireplumber_fragment_path()?;
+        if fragment_path.exists() {
+            fs::remove_file(&fragment_path).await.with_context(|| {
+                format!(
+                    "failed to remove WirePlumber Bluetooth-disable fragment {}",
+                    fragment_path.display()
+                )
+            })?;
+        }
+
+        self.cleanup_legacy_wireplumber_dropin().await?;
+        self.remove_legacy_fragment().await?;
+        self.run_user_systemctl(["try-restart", "wireplumber.service"])
+            .await?;
+        Ok(())
     }
 
     pub async fn cleanup_legacy_wireplumber_dropin(&self) -> Result<bool> {
@@ -51,35 +150,57 @@ impl SystemdUserRuntime {
                 dropin_path.display()
             )
         })?;
-        self.run_systemctl(["daemon-reload"]).await?;
+        self.run_user_systemctl(["daemon-reload"]).await?;
         Ok(true)
     }
 
-    pub async fn service_status(&self, unit_name: &str) -> Result<UserServiceStatus> {
+    pub async fn remove_legacy_fragment(&self) -> Result<bool> {
+        let fragment_path = legacy_wireplumber_fragment_path()?;
+        if !fragment_path.exists() {
+            return Ok(false);
+        }
+
+        fs::remove_file(&fragment_path).await.with_context(|| {
+            format!(
+                "failed to remove legacy WirePlumber fragment {}",
+                fragment_path.display()
+            )
+        })?;
+        Ok(true)
+    }
+
+    pub async fn user_service_status(&self, unit_name: &str) -> Result<ServiceStatus> {
+        self.service_status(["--user", "show", unit_name]).await
+    }
+
+    pub async fn system_service_status(&self, unit_name: &str) -> Result<ServiceStatus> {
+        self.service_status(["show", unit_name]).await
+    }
+
+    pub fn wireplumber_fragment_installed(&self) -> Result<bool> {
+        Ok(wireplumber_fragment_path()?.exists())
+    }
+
+    async fn service_status<const N: usize>(&self, args: [&str; N]) -> Result<ServiceStatus> {
         let output = Command::new("systemctl")
-            .args([
-                "--user",
-                "show",
-                unit_name,
-                "--property=ActiveState,SubState,Result,NRestarts",
-            ])
+            .args(args)
+            .args(["--property=ActiveState,SubState,Result,NRestarts"])
             .output()
             .await
-            .with_context(|| format!("failed to invoke systemctl --user show {unit_name}"))?;
+            .with_context(|| format!("failed to invoke systemctl {:?}", args))?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "systemctl --user show {unit_name} failed: {}",
+                "systemctl {:?} failed: {}",
+                args,
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
 
-        parse_service_status(&String::from_utf8_lossy(&output.stdout)).with_context(|| {
-            format!("failed to parse systemctl --user show output for {unit_name}")
-        })
+        parse_service_status(&String::from_utf8_lossy(&output.stdout))
     }
 
-    async fn run_systemctl<const N: usize>(&self, args: [&str; N]) -> Result<()> {
+    async fn run_user_systemctl<const N: usize>(&self, args: [&str; N]) -> Result<()> {
         let output = Command::new("systemctl")
             .args(["--user"])
             .args(args)
@@ -97,11 +218,36 @@ impl SystemdUserRuntime {
 
         Ok(())
     }
+
+    async fn run_sudo<const N: usize>(&self, args: [&str; N]) -> Result<()> {
+        let output = Command::new("sudo")
+            .args(args)
+            .output()
+            .await
+            .with_context(|| format!("failed to invoke sudo {:?}", args))?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "sudo {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        Ok(())
+    }
 }
 
-fn unit_path() -> Result<PathBuf> {
+fn user_unit_path() -> Result<PathBuf> {
     let home = home_dir().context("unable to determine home directory")?;
-    Ok(home.join(".config/systemd/user").join(UNIT_NAME))
+    Ok(home.join(".config/systemd/user").join(USER_UNIT_NAME))
+}
+
+fn wireplumber_fragment_path() -> Result<PathBuf> {
+    let home = home_dir().context("unable to determine home directory")?;
+    Ok(home
+        .join(".config/wireplumber/wireplumber.conf.d")
+        .join(BACKEND_FRAGMENT_NAME))
 }
 
 fn legacy_wireplumber_dropin_path() -> Result<PathBuf> {
@@ -111,7 +257,22 @@ fn legacy_wireplumber_dropin_path() -> Result<PathBuf> {
         .join(LEGACY_WIREPLUMBER_DROPIN))
 }
 
-fn parse_service_status(output: &str) -> Result<UserServiceStatus> {
+fn legacy_wireplumber_fragment_path() -> Result<PathBuf> {
+    let home = home_dir().context("unable to determine home directory")?;
+    Ok(home
+        .join(".config/wireplumber/wireplumber.conf.d")
+        .join(LEGACY_WIREPLUMBER_FRAGMENT))
+}
+
+fn system_backend_unit_path() -> PathBuf {
+    Path::new(SYSTEM_UNIT_DIR).join(SYSTEM_BACKEND_UNIT)
+}
+
+fn legacy_system_backend_unit_path() -> PathBuf {
+    Path::new(SYSTEM_UNIT_DIR).join(LEGACY_SYSTEM_BACKEND_UNIT)
+}
+
+fn parse_service_status(output: &str) -> Result<ServiceStatus> {
     let mut active_state = None;
     let mut sub_state = None;
     let mut result = None;
@@ -131,7 +292,7 @@ fn parse_service_status(output: &str) -> Result<UserServiceStatus> {
         }
     }
 
-    Ok(UserServiceStatus {
+    Ok(ServiceStatus {
         active_state: active_state.context("missing ActiveState")?,
         sub_state: sub_state.context("missing SubState")?,
         result,
@@ -139,24 +300,53 @@ fn parse_service_status(output: &str) -> Result<UserServiceStatus> {
     })
 }
 
-pub fn render_unit(daemon_path: &Path) -> String {
+pub fn render_user_unit(daemon_path: &Path) -> String {
     format!(
         "[Unit]\nDescription=Orators Bluetooth speaker daemon\nAfter=default.target bluetooth.target\n\n[Service]\nType=simple\nExecStart={} \nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
         daemon_path.display()
     )
 }
 
+pub fn render_system_backend_unit(bluealsad_path: &Path, adapter: &str) -> String {
+    format!(
+        "[Unit]\nDescription=Orators BlueALSA backend\nAfter=bluetooth.service\nRequires=bluetooth.service\n\n[Service]\nType=simple\nExecStart={} -p a2dp-sink -i {}\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
+        bluealsad_path.display(),
+        adapter,
+    )
+}
+
+pub fn render_wireplumber_fragment() -> &'static str {
+    "wireplumber.profiles = {\n  main = {\n    monitor.bluez = disabled\n    monitor.bluez-midi = disabled\n  }\n}\n"
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{parse_service_status, render_unit};
+    use super::{
+        parse_service_status, render_system_backend_unit, render_user_unit,
+        render_wireplumber_fragment,
+    };
 
     #[test]
-    fn renders_unit_file_with_binary_path() {
-        let unit = render_unit(Path::new("/tmp/oratorsd"));
+    fn renders_user_unit_file_with_binary_path() {
+        let unit = render_user_unit(Path::new("/tmp/oratorsd"));
         assert!(unit.contains("ExecStart=/tmp/oratorsd"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn renders_system_backend_unit() {
+        let unit = render_system_backend_unit(Path::new("/usr/bin/bluealsad"), "hci1");
+        assert!(unit.contains("ExecStart=/usr/bin/bluealsad -p a2dp-sink -i hci1"));
+        assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn renders_wireplumber_fragment() {
+        let fragment = render_wireplumber_fragment();
+        assert!(fragment.contains("monitor.bluez = disabled"));
+        assert!(fragment.contains("monitor.bluez-midi = disabled"));
     }
 
     #[test]

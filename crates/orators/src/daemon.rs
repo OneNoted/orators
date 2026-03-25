@@ -30,9 +30,9 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
     let monitor_service = Arc::clone(&service);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Err(error) = monitor_service.expire_pairing_if_needed().await {
-                tracing::warn!(?error, "failed to expire pairing window");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Err(error) = monitor_service.background_tick().await {
+                tracing::warn!(?error, "failed to reconcile Orators background runtime");
             }
         }
     });

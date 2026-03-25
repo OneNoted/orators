@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -46,18 +47,20 @@ pub struct RemoteDeviceInfo {
 }
 
 pub fn remote_device_supports_media(device: &RemoteDeviceInfo) -> bool {
-    device.uuids.iter().any(|uuid| {
-        uuid.eq_ignore_ascii_case(A2DP_SOURCE_UUID) || uuid.eq_ignore_ascii_case(A2DP_SINK_UUID)
-    })
+    device
+        .uuids
+        .iter()
+        .any(|uuid| uuid.eq_ignore_ascii_case(A2DP_SOURCE_UUID))
 }
 
 pub struct BluetoothCtlBluez {
     connection: Connection,
     agent_state: Arc<PairingAgentState>,
+    preferred_adapter: Option<String>,
 }
 
 impl BluetoothCtlBluez {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(preferred_adapter: Option<String>) -> Result<Self> {
         let connection = Connection::system()
             .await
             .context("failed to connect to system bus for BlueZ")?;
@@ -72,6 +75,7 @@ impl BluetoothCtlBluez {
         let runtime = Self {
             connection,
             agent_state,
+            preferred_adapter,
         };
         runtime.register_agent().await?;
         Ok(runtime)
@@ -84,8 +88,12 @@ impl BluetoothCtlBluez {
     pub async fn adapter_info(&self) -> Result<AdapterInfo> {
         let managed = self.managed_objects().await?;
         let adapter = managed
-            .values()
-            .find_map(|interfaces| interfaces.get("org.bluez.Adapter1"))
+            .iter()
+            .find(|(path, interfaces)| {
+                interfaces.contains_key("org.bluez.Adapter1")
+                    && self.path_matches_preferred_adapter(path)
+            })
+            .and_then(|(_, interfaces)| interfaces.get("org.bluez.Adapter1"))
             .context("no BlueZ adapter found")?;
 
         Ok(AdapterInfo {
@@ -102,12 +110,32 @@ impl BluetoothCtlBluez {
 
     pub async fn list_devices(&self, auto_reconnect: bool) -> Result<Vec<DeviceInfo>> {
         let managed = self.managed_objects().await?;
-        Ok(parse_devices(&managed, auto_reconnect))
+        Ok(parse_devices(
+            &managed,
+            auto_reconnect,
+            self.preferred_adapter.as_deref(),
+        ))
     }
 
     pub async fn remote_devices(&self) -> Result<Vec<RemoteDeviceInfo>> {
         let managed = self.managed_objects().await?;
-        Ok(parse_remote_devices(&managed))
+        Ok(parse_remote_devices(
+            &managed,
+            self.preferred_adapter.as_deref(),
+        ))
+    }
+
+    pub async fn powered_adapter_ids(&self) -> Result<Vec<String>> {
+        let managed = self.managed_objects().await?;
+        Ok(managed
+            .iter()
+            .filter_map(|(path, interfaces)| {
+                let adapter = interfaces.get("org.bluez.Adapter1")?;
+                bool_prop(adapter, "Powered")
+                    .filter(|powered| *powered)
+                    .map(|_| adapter_id_from_path(path))
+            })
+            .collect())
     }
 
     pub async fn start_pairing(&self, timeout_secs: u64) -> Result<()> {
@@ -249,6 +277,28 @@ impl BluetoothCtlBluez {
         Ok(())
     }
 
+    pub async fn wait_for_connected(&self, address: &str, timeout: Duration) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(device) = self
+                .remote_devices()
+                .await?
+                .into_iter()
+                .find(|device| device.address == address)
+            {
+                if device.connected {
+                    return Ok(true);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     pub async fn disconnect_device(&self, address: &str) -> Result<()> {
         let device_path = self.device_path(address).await?;
         let device = Proxy::new(
@@ -325,9 +375,9 @@ impl BluetoothCtlBluez {
         managed
             .into_iter()
             .find_map(|(path, interfaces)| {
-                interfaces
-                    .contains_key("org.bluez.Adapter1")
-                    .then_some(path)
+                (interfaces.contains_key("org.bluez.Adapter1")
+                    && self.path_matches_preferred_adapter(&path))
+                .then_some(path)
             })
             .context("no BlueZ adapter found")
     }
@@ -337,11 +387,20 @@ impl BluetoothCtlBluez {
         managed
             .into_iter()
             .find_map(|(path, interfaces)| {
+                if !self.path_matches_preferred_adapter(&path) {
+                    return None;
+                }
                 let props = interfaces.get("org.bluez.Device1")?;
                 let candidate = string_prop(props, "Address")?;
                 (candidate == address).then_some(path)
             })
             .with_context(|| format!("no BlueZ device found for {address}"))
+    }
+
+    fn path_matches_preferred_adapter(&self, path: &OwnedObjectPath) -> bool {
+        self.preferred_adapter
+            .as_deref()
+            .is_none_or(|adapter| path.as_str().contains(&format!("/{adapter}")))
     }
 }
 
@@ -481,10 +540,17 @@ impl PairingAgent {
     fn cancel(&self) {}
 }
 
-fn parse_devices(managed: &ManagedObjects, auto_reconnect: bool) -> Vec<DeviceInfo> {
+fn parse_devices(
+    managed: &ManagedObjects,
+    auto_reconnect: bool,
+    preferred_adapter: Option<&str>,
+) -> Vec<DeviceInfo> {
     let active_profiles = parse_active_profiles(managed);
     managed
         .iter()
+        .filter(|(path, _)| {
+            preferred_adapter.is_none_or(|adapter| path.as_str().contains(&format!("/{adapter}/")))
+        })
         .filter_map(|(path, interfaces)| {
             interfaces.get("org.bluez.Device1").and_then(|properties| {
                 parse_device(path, properties, &active_profiles, auto_reconnect)
@@ -593,10 +659,16 @@ fn object_path_prop(
         .and_then(|value| OwnedObjectPath::try_from(value).ok())
 }
 
-fn parse_remote_devices(managed: &ManagedObjects) -> Vec<RemoteDeviceInfo> {
+fn parse_remote_devices(
+    managed: &ManagedObjects,
+    preferred_adapter: Option<&str>,
+) -> Vec<RemoteDeviceInfo> {
     managed
-        .values()
-        .filter_map(|interfaces| interfaces.get("org.bluez.Device1"))
+        .iter()
+        .filter(|(path, _)| {
+            preferred_adapter.is_none_or(|adapter| path.as_str().contains(&format!("/{adapter}/")))
+        })
+        .filter_map(|(_, interfaces)| interfaces.get("org.bluez.Device1"))
         .filter_map(|properties| {
             Some(RemoteDeviceInfo {
                 address: string_prop(properties, "Address")?,
@@ -609,6 +681,15 @@ fn parse_remote_devices(managed: &ManagedObjects) -> Vec<RemoteDeviceInfo> {
         .collect()
 }
 
+fn adapter_id_from_path(path: &OwnedObjectPath) -> String {
+    path.as_str()
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -617,8 +698,8 @@ mod tests {
     use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Str};
 
     use super::{
-        A2DP_SOURCE_UUID, AdapterInfo, AgentError, DeviceAuthorizationState,
-        RemoteDeviceInfo, authorize_device_state, parse_device, parse_transport_profile,
+        A2DP_SOURCE_UUID, AdapterInfo, AgentError, DeviceAuthorizationState, RemoteDeviceInfo,
+        authorize_device_state, parse_device, parse_transport_profile,
         remote_device_supports_media,
     };
 
