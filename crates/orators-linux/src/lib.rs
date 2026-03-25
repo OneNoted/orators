@@ -1,43 +1,50 @@
 pub mod audio;
 pub mod bluez;
 pub mod diagnostics;
+pub mod owned_backend;
 pub mod systemd;
-pub mod wireplumber;
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use orators_core::{
-    AudioDefaults, DeviceInfo, DiagnosticsReport, OratorsConfig, SessionConfigStatus,
-};
+use orators_core::{AudioDefaults, DeviceInfo, DiagnosticsReport, OratorsConfig};
 
 use crate::{
     audio::WpctlAudioRuntime,
     bluez::BluetoothCtlBluez,
     diagnostics::collect_report,
-    systemd::SystemdUserRuntime,
-    wireplumber::{WirePlumberRoles, WirePlumberRuntime},
+    owned_backend::OwnedBluetoothMediaBackend,
+    systemd::{ManagedBackendStatus, SystemdUserRuntime},
 };
 
 pub struct LinuxPlatform {
     bluez: BluetoothCtlBluez,
     audio: WpctlAudioRuntime,
-    wireplumber: WirePlumberRuntime,
+    owned_backend: Option<OwnedBluetoothMediaBackend>,
     systemd: SystemdUserRuntime,
-    fragment_path: PathBuf,
     config: OratorsConfig,
 }
 
 impl LinuxPlatform {
-    pub fn new(fragment_path: PathBuf, config: OratorsConfig) -> Self {
-        Self {
-            bluez: BluetoothCtlBluez,
+    pub async fn new(config: OratorsConfig) -> Result<Self> {
+        let systemd = SystemdUserRuntime;
+        let managed_backend = systemd.managed_backend_status().await.ok();
+        let owned_backend = if managed_backend
+            .as_ref()
+            .is_some_and(|status| status.installed && status.wireplumber_audio_profile)
+        {
+            Some(OwnedBluetoothMediaBackend::new().await?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            bluez: BluetoothCtlBluez::new().await?,
             audio: WpctlAudioRuntime,
-            wireplumber: WirePlumberRuntime,
-            systemd: SystemdUserRuntime,
-            fragment_path,
+            owned_backend,
+            systemd,
             config,
-        }
+        })
     }
 
     pub async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
@@ -45,6 +52,7 @@ impl LinuxPlatform {
     }
 
     pub async fn start_pairing(&self, timeout_secs: u64) -> Result<()> {
+        self.ensure_host_media_ready().await?;
         self.bluez.start_pairing(timeout_secs).await
     }
 
@@ -56,12 +64,22 @@ impl LinuxPlatform {
         self.bluez.trust_device(address).await
     }
 
+    pub async fn untrust_device(&self, address: &str) -> Result<()> {
+        self.bluez.untrust_device(address).await
+    }
+
     pub async fn forget_device(&self, address: &str) -> Result<()> {
         self.bluez.forget_device(address).await
     }
 
     pub async fn connect_device(&self, address: &str) -> Result<()> {
-        self.bluez.connect_device(address).await
+        self.ensure_host_media_ready().await?;
+        self.bluez.connect_device(address).await?;
+        if self.owned_backend.is_some() {
+            Ok(())
+        } else {
+            self.audio.pin_device_to_a2dp(address).await
+        }
     }
 
     pub async fn disconnect_device(&self, address: &str) -> Result<()> {
@@ -69,36 +87,77 @@ impl LinuxPlatform {
     }
 
     pub async fn current_audio_defaults(&self) -> Result<AudioDefaults> {
-        let roles = self
-            .wireplumber
-            .roles(&self.fragment_path)
+        let adapter = self.bluez.adapter_info().await.ok();
+        let active_device = self
+            .bluez
+            .list_devices(self.config.auto_reconnect)
             .await
-            .unwrap_or(WirePlumberRoles {
-                a2dp_sink_enabled: false,
-                hfp_ag_enabled: false,
-            });
-        self.audio
-            .current_defaults(roles.a2dp_sink_enabled, roles.hfp_ag_enabled)
-            .await
+            .ok()
+            .and_then(|devices| devices.into_iter().find(|device| device.connected))
+            .map(|device| device.address);
+
+        let mut defaults = self
+            .audio
+            .current_defaults(
+                adapter.as_ref().is_some_and(adapter_supports_media),
+                adapter.as_ref().is_some_and(adapter_exposes_call_roles),
+                active_device.as_deref(),
+            )
+            .await?;
+        if self.owned_backend.is_some() {
+            defaults.call_roles_detected = false;
+        }
+        Ok(defaults)
     }
 
-    pub async fn apply_session_config(&self) -> Result<SessionConfigStatus> {
-        let report = self
-            .wireplumber
-            .ensure_fragment(&self.fragment_path)
-            .await?;
-        if report.changed {
-            let _ = self.systemd.try_restart("wireplumber.service").await;
+    pub async fn ensure_host_media_ready(&self) -> Result<()> {
+        let adapter = self.bluez.adapter_info().await?;
+        if !adapter_supports_media(&adapter) {
+            anyhow::bail!(
+                "the stock Bluetooth stack does not advertise Audio Sink / A2DP media support"
+            );
         }
-        Ok(report)
+
+        let wireplumber = self.systemd.service_status("wireplumber.service").await?;
+        if wireplumber.active_state != "active" || wireplumber.sub_state != "running" {
+            anyhow::bail!(
+                "wireplumber.service is not healthy: ActiveState={}, SubState={}",
+                wireplumber.active_state,
+                wireplumber.sub_state
+            );
+        }
+
+        let defaults = self.audio.pipewire_defaults().await?;
+        if defaults.output_device.is_none() || defaults.output_is_dummy {
+            anyhow::bail!("PipeWire does not currently have a usable default sink");
+        }
+
+        self.audio.disable_headset_autoswitch().await?;
+
+        Ok(())
+    }
+
+    pub async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()> {
+        if let Some(address) = active_device {
+            let wireplumber = self.systemd.service_status("wireplumber.service").await?;
+            if wireplumber.active_state != "active" || wireplumber.sub_state != "running" {
+                anyhow::bail!(
+                    "wireplumber.service became unhealthy while Bluetooth audio was active"
+                );
+            }
+
+            self.audio.guard_active_device_audio(address).await?;
+        }
+
+        Ok(())
     }
 
     pub async fn diagnostics(&self) -> Result<DiagnosticsReport> {
         collect_report(
             &self.bluez,
             &self.audio,
-            &self.wireplumber,
-            &self.fragment_path,
+            self.owned_backend.as_ref(),
+            &self.systemd,
         )
         .await
     }
@@ -107,8 +166,16 @@ impl LinuxPlatform {
         self.systemd.install_user_service(daemon_path).await
     }
 
-    pub fn fragment_path(&self) -> &Path {
-        &self.fragment_path
+    pub async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus> {
+        self.systemd.install_host_backend(daemon_path).await
+    }
+
+    pub async fn uninstall_host_backend(&self) -> Result<()> {
+        self.systemd.uninstall_host_backend().await
+    }
+
+    pub async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
+        self.systemd.managed_backend_status().await
     }
 }
 
@@ -117,4 +184,23 @@ pub fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn adapter_supports_media(adapter: &crate::bluez::AdapterInfo) -> bool {
+    adapter.uuids.iter().any(|uuid| {
+        uuid.eq_ignore_ascii_case("0000110b-0000-1000-8000-00805f9b34fb")
+            || uuid.eq_ignore_ascii_case("0000110d-0000-1000-8000-00805f9b34fb")
+    })
+}
+
+fn adapter_exposes_call_roles(adapter: &crate::bluez::AdapterInfo) -> bool {
+    adapter.uuids.iter().any(|uuid| {
+        matches!(
+            uuid.to_ascii_lowercase().as_str(),
+            "00001108-0000-1000-8000-00805f9b34fb"
+                | "00001112-0000-1000-8000-00805f9b34fb"
+                | "0000111e-0000-1000-8000-00805f9b34fb"
+                | "0000111f-0000-1000-8000-00805f9b34fb"
+        )
+    })
 }

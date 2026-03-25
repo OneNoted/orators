@@ -21,18 +21,17 @@ pub struct DaemonArgs {
 pub async fn run(args: DaemonArgs) -> Result<()> {
     let config_path = args.config.unwrap_or(default_config_path()?);
     let config = ensure_config_exists(&config_path)?;
-    let paths = RuntimePaths::discover(config_path, &config)?;
+    let paths = RuntimePaths::discover()?;
     tokio::fs::create_dir_all(&paths.state_dir).await?;
 
-    let runtime = Arc::new(LinuxPlatform::new(paths.fragment_path, config.clone()));
-    runtime.apply_session_config().await?;
+    let runtime = Arc::new(LinuxPlatform::new(config.clone()).await?);
     let service = Arc::new(OratorsService::new(runtime, config));
 
-    let expiry_service = Arc::clone(&service);
+    let monitor_service = Arc::clone(&service);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Err(error) = expiry_service.expire_pairing_if_needed().await {
+            if let Err(error) = monitor_service.expire_pairing_if_needed().await {
                 tracing::warn!(?error, "failed to expire pairing window");
             }
         }
@@ -51,28 +50,17 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
 }
 
 pub struct RuntimePaths {
-    pub config_path: PathBuf,
     pub state_dir: PathBuf,
-    pub fragment_path: PathBuf,
 }
 
 impl RuntimePaths {
-    pub fn discover(config_path: PathBuf, config: &OratorsConfig) -> Result<Self> {
+    pub fn discover() -> Result<Self> {
         let state_dir = dirs::state_dir()
             .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
             .context("unable to determine state directory")?
             .join("orators");
-        let fragment_path = dirs::config_dir()
-            .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
-            .context("unable to determine config directory")?
-            .join("wireplumber/wireplumber.conf.d")
-            .join(&config.wireplumber_fragment_name);
 
-        Ok(Self {
-            config_path,
-            state_dir,
-            fragment_path,
-        })
+        Ok(Self { state_dir })
     }
 }
 
@@ -157,6 +145,19 @@ impl DbusApi {
         Ok(status)
     }
 
+    #[zbus(name = "UntrustDevice")]
+    async fn untrust_device(
+        &self,
+        address: &str,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let status = self.service.untrust_device(address).await.map_err(to_fdo)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(status)
+    }
+
     #[zbus(name = "ForgetDevice")]
     async fn forget_device(
         &self,
@@ -203,19 +204,6 @@ impl DbusApi {
             .await
             .map_err(to_fdo_zbus)?;
         Ok(status)
-    }
-
-    #[zbus(name = "ApplySessionConfig")]
-    async fn apply_session_config(
-        &self,
-        #[zbus(signal_context)] ctxt: SignalContext<'_>,
-    ) -> fdo::Result<String> {
-        let report = self.service.apply_session_config().await.map_err(to_fdo)?;
-        let diagnostics = self.service.diagnostics_json().await.map_err(to_fdo)?;
-        Self::diagnostics_changed(&ctxt, &diagnostics)
-            .await
-            .map_err(to_fdo_zbus)?;
-        Ok(report)
     }
 
     #[zbus(name = "GetDiagnostics")]

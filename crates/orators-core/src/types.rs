@@ -22,8 +22,10 @@ pub struct DeviceInfo {
 pub struct AudioDefaults {
     pub output_device: Option<String>,
     pub input_device: Option<String>,
-    pub a2dp_sink_enabled: bool,
-    pub hfp_ag_enabled: bool,
+    pub bluetooth_audio_supported: bool,
+    pub call_roles_detected: bool,
+    pub active_bluetooth_profile: Option<BluetoothProfile>,
+    pub a2dp_pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,10 +41,4 @@ pub struct RuntimeStatus {
     pub active_device: Option<String>,
     pub devices: Vec<DeviceInfo>,
     pub audio: AudioDefaults,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionConfigStatus {
-    pub path: String,
-    pub changed: bool,
 }

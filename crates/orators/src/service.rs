@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use orators_core::{
     AudioDefaults, BluetoothProfile, DeviceInfo, DiagnosticsReport, OratorsConfig, OratorsState,
-    SessionConfigStatus,
 };
+use orators_linux::systemd::ManagedBackendStatus;
 use tokio::sync::Mutex;
 
 #[async_trait]
@@ -14,13 +14,18 @@ pub trait PlatformRuntime: Send + Sync {
     async fn start_pairing(&self, timeout_secs: u64) -> Result<()>;
     async fn stop_pairing(&self) -> Result<()>;
     async fn trust_device(&self, address: &str) -> Result<()>;
+    async fn untrust_device(&self, address: &str) -> Result<()>;
     async fn forget_device(&self, address: &str) -> Result<()>;
     async fn connect_device(&self, address: &str) -> Result<()>;
     async fn disconnect_device(&self, address: &str) -> Result<()>;
     async fn current_audio_defaults(&self) -> Result<AudioDefaults>;
-    async fn apply_session_config(&self) -> Result<SessionConfigStatus>;
+    async fn ensure_host_media_ready(&self) -> Result<()>;
+    async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()>;
     async fn diagnostics(&self) -> Result<DiagnosticsReport>;
     async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf>;
+    async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus>;
+    async fn uninstall_host_backend(&self) -> Result<()>;
+    async fn managed_backend_status(&self) -> Result<ManagedBackendStatus>;
 }
 
 #[async_trait]
@@ -41,6 +46,10 @@ impl PlatformRuntime for orators_linux::LinuxPlatform {
         self.trust_device(address).await
     }
 
+    async fn untrust_device(&self, address: &str) -> Result<()> {
+        self.untrust_device(address).await
+    }
+
     async fn forget_device(&self, address: &str) -> Result<()> {
         self.forget_device(address).await
     }
@@ -57,8 +66,12 @@ impl PlatformRuntime for orators_linux::LinuxPlatform {
         self.current_audio_defaults().await
     }
 
-    async fn apply_session_config(&self) -> Result<SessionConfigStatus> {
-        self.apply_session_config().await
+    async fn ensure_host_media_ready(&self) -> Result<()> {
+        self.ensure_host_media_ready().await
+    }
+
+    async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()> {
+        self.guard_active_audio(active_device).await
     }
 
     async fn diagnostics(&self) -> Result<DiagnosticsReport> {
@@ -67,6 +80,18 @@ impl PlatformRuntime for orators_linux::LinuxPlatform {
 
     async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {
         self.install_user_service(daemon_path).await
+    }
+
+    async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus> {
+        self.install_host_backend(daemon_path).await
+    }
+
+    async fn uninstall_host_backend(&self) -> Result<()> {
+        self.uninstall_host_backend().await
+    }
+
+    async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
+        self.managed_backend_status().await
     }
 }
 
@@ -109,20 +134,24 @@ impl<R: PlatformRuntime> OratorsService<R> {
 
     pub async fn start_pairing(&self, timeout_secs: Option<u64>) -> Result<String> {
         let timeout_secs = timeout_secs.unwrap_or_else(|| self.default_timeout());
+        self.runtime.ensure_host_media_ready().await?;
         self.runtime.start_pairing(timeout_secs).await?;
 
         let now = now_epoch_secs();
-        let mut state = self.state.lock().await;
-        state.start_pairing(now, Some(timeout_secs));
-        serialize(&state.status(now))
+        {
+            let mut state = self.state.lock().await;
+            state.start_pairing(now, Some(timeout_secs));
+        }
+        self.status_json().await
     }
 
     pub async fn stop_pairing(&self) -> Result<String> {
         self.runtime.stop_pairing().await?;
-        let now = now_epoch_secs();
-        let mut state = self.state.lock().await;
-        state.stop_pairing();
-        serialize(&state.status(now))
+        {
+            let mut state = self.state.lock().await;
+            state.stop_pairing();
+        }
+        self.status_json().await
     }
 
     pub async fn expire_pairing_if_needed(&self) -> Result<Option<String>> {
@@ -133,6 +162,7 @@ impl<R: PlatformRuntime> OratorsService<R> {
         };
 
         if expired {
+            tracing::info!("pairing window expired; keeping existing device connections intact");
             self.runtime.stop_pairing().await?;
             return Ok(Some(self.status_json().await?));
         }
@@ -160,7 +190,18 @@ impl<R: PlatformRuntime> OratorsService<R> {
         serialize(&state.status(now))
     }
 
+    pub async fn untrust_device(&self, address: &str) -> Result<String> {
+        self.refresh_status().await?;
+        self.runtime.untrust_device(address).await?;
+
+        let now = now_epoch_secs();
+        let mut state = self.state.lock().await;
+        state.untrust_device(address)?;
+        serialize(&state.status(now))
+    }
+
     pub async fn connect_device(&self, address: &str) -> Result<String> {
+        self.runtime.ensure_host_media_ready().await?;
         self.refresh_status().await?;
         self.runtime.connect_device(address).await?;
 
@@ -181,11 +222,6 @@ impl<R: PlatformRuntime> OratorsService<R> {
         self.status_json().await
     }
 
-    pub async fn apply_session_config(&self) -> Result<String> {
-        let report = self.runtime.apply_session_config().await?;
-        serialize(&report)
-    }
-
     pub async fn diagnostics_json(&self) -> Result<String> {
         let report = self.runtime.diagnostics().await?;
         serialize(&report)
@@ -196,14 +232,84 @@ impl<R: PlatformRuntime> OratorsService<R> {
         Ok(unit_path.display().to_string())
     }
 
+    pub async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus> {
+        self.runtime.install_host_backend(daemon_path).await
+    }
+
+    pub async fn uninstall_host_backend(&self) -> Result<()> {
+        self.runtime.uninstall_host_backend().await
+    }
+
+    pub async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
+        self.runtime.managed_backend_status().await
+    }
+
+    pub async fn protect_active_audio_if_needed(&self) -> Result<Option<String>> {
+        let active_device = {
+            self.state
+                .lock()
+                .await
+                .status(now_epoch_secs())
+                .active_device
+        };
+        let Some(active_device) = active_device else {
+            return Ok(None);
+        };
+
+        if let Err(error) = self.runtime.guard_active_audio(Some(&active_device)).await {
+            tracing::warn!(
+                address = %active_device,
+                ?error,
+                "active bluetooth audio became unhealthy; disconnecting device"
+            );
+            if let Err(disconnect_error) = self.runtime.disconnect_device(&active_device).await {
+                tracing::warn!(
+                    address = %active_device,
+                    ?disconnect_error,
+                    "failed to disconnect unhealthy bluetooth audio device"
+                );
+            }
+
+            let mut state = self.state.lock().await;
+            state.disconnect_active();
+            return Ok(Some(serialize(&state.status(now_epoch_secs()))?));
+        }
+
+        Ok(None)
+    }
+
     async fn refresh_status(&self) -> Result<orators_core::RuntimeStatus> {
         let devices = self.runtime.list_devices().await?;
+        let devices = self.apply_allowlist_if_needed(devices).await?;
         let audio = self.runtime.current_audio_defaults().await?;
         let now = now_epoch_secs();
         let mut state = self.state.lock().await;
         state.sync_devices(devices);
         state.update_audio(audio);
         Ok(state.status(now))
+    }
+
+    async fn apply_allowlist_if_needed(&self, devices: Vec<DeviceInfo>) -> Result<Vec<DeviceInfo>> {
+        let allowlisted = devices
+            .iter()
+            .filter(|device| {
+                device.paired && !device.trusted && self.config.allows_device(&device.address)
+            })
+            .map(|device| device.address.clone())
+            .collect::<Vec<_>>();
+
+        if allowlisted.is_empty() {
+            return Ok(devices);
+        }
+
+        for address in &allowlisted {
+            self.runtime
+                .trust_device(address)
+                .await
+                .with_context(|| format!("failed to trust allowlisted device {address}"))?;
+        }
+
+        self.runtime.list_devices().await
     }
 
     fn default_timeout(&self) -> u64 {
@@ -229,14 +335,16 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use orators_core::{
-        AudioDefaults, DeviceInfo, DiagnosticsReport, OratorsConfig, SessionConfigStatus,
+        AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, OratorsConfig, Severity,
     };
+    use orators_linux::systemd::ManagedBackendStatus;
 
     use super::{OratorsService, PlatformRuntime};
 
     struct MockRuntime {
         devices: tokio::sync::Mutex<Vec<DeviceInfo>>,
         disconnects: tokio::sync::Mutex<Vec<String>>,
+        stop_pairing_calls: tokio::sync::Mutex<usize>,
     }
 
     impl MockRuntime {
@@ -244,6 +352,7 @@ mod tests {
             Self {
                 devices: tokio::sync::Mutex::new(devices),
                 disconnects: tokio::sync::Mutex::new(Vec::new()),
+                stop_pairing_calls: tokio::sync::Mutex::new(0),
             }
         }
     }
@@ -259,6 +368,7 @@ mod tests {
         }
 
         async fn stop_pairing(&self) -> Result<()> {
+            *self.stop_pairing_calls.lock().await += 1;
             Ok(())
         }
 
@@ -271,6 +381,19 @@ mod tests {
                 .find(|device| device.address == address)
             {
                 device.trusted = true;
+            }
+            Ok(())
+        }
+
+        async fn untrust_device(&self, address: &str) -> Result<()> {
+            if let Some(device) = self
+                .devices
+                .lock()
+                .await
+                .iter_mut()
+                .find(|device| device.address == address)
+            {
+                device.trusted = false;
             }
             Ok(())
         }
@@ -305,27 +428,64 @@ mod tests {
             Ok(AudioDefaults {
                 output_device: Some("Speakers".to_string()),
                 input_device: Some("Microphone".to_string()),
-                a2dp_sink_enabled: true,
-                hfp_ag_enabled: true,
+                bluetooth_audio_supported: true,
+                call_roles_detected: false,
+                active_bluetooth_profile: None,
+                a2dp_pinned: true,
             })
         }
 
-        async fn apply_session_config(&self) -> Result<SessionConfigStatus> {
-            Ok(SessionConfigStatus {
-                path: "/tmp/test.conf".to_string(),
-                changed: false,
-            })
+        async fn ensure_host_media_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn guard_active_audio(&self, _active_device: Option<&str>) -> Result<()> {
+            Ok(())
         }
 
         async fn diagnostics(&self) -> Result<DiagnosticsReport> {
             Ok(DiagnosticsReport {
                 generated_at_epoch_secs: 1,
-                checks: Vec::new(),
+                checks: vec![DiagnosticCheck {
+                    code: "bluez.adapter".to_string(),
+                    severity: Severity::Info,
+                    summary: "BlueZ adapter is ready for pairing".to_string(),
+                    detail: Some(
+                        "Look for Bluetooth device 'aeolus' (04:7F:0E:02:13:3C). powered=yes, discoverable=yes, pairable=yes, scanning=no.".to_string(),
+                    ),
+                    remediation: None,
+                }],
             })
         }
 
         async fn install_user_service(&self, _daemon_path: &Path) -> Result<PathBuf> {
             Ok(PathBuf::from("/tmp/oratorsd.service"))
+        }
+
+        async fn install_host_backend(&self, _daemon_path: &Path) -> Result<ManagedBackendStatus> {
+            Ok(ManagedBackendStatus {
+                installed: true,
+                wireplumber_audio_profile: true,
+                unit_path: PathBuf::from("/tmp/oratorsd.service"),
+                wireplumber_dropin_path: PathBuf::from(
+                    "/tmp/wireplumber.service.d/90-orators-audio-owner.conf",
+                ),
+            })
+        }
+
+        async fn uninstall_host_backend(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
+            Ok(ManagedBackendStatus {
+                installed: true,
+                wireplumber_audio_profile: true,
+                unit_path: PathBuf::from("/tmp/oratorsd.service"),
+                wireplumber_dropin_path: PathBuf::from(
+                    "/tmp/wireplumber.service.d/90-orators-audio-owner.conf",
+                ),
+            })
         }
     }
 
@@ -349,6 +509,7 @@ mod tests {
         let status = service.start_pairing(Some(30)).await.unwrap();
 
         assert!(status.contains("\"enabled\": true"));
+        assert!(status.contains("Speakers"));
     }
 
     #[tokio::test]
@@ -361,5 +522,35 @@ mod tests {
 
         let disconnects = runtime.disconnects.lock().await.clone();
         assert_eq!(disconnects, vec!["AA".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn expiring_pairing_keeps_active_device_connected() {
+        let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
+        let service = OratorsService::new(runtime.clone(), OratorsConfig::default());
+
+        service.connect_device("AA").await.unwrap();
+        service.start_pairing(Some(1)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let expired = service.expire_pairing_if_needed().await.unwrap().unwrap();
+        let expired: orators_core::RuntimeStatus = serde_json::from_str(&expired).unwrap();
+
+        assert_eq!(expired.active_device.as_deref(), Some("AA"));
+        assert_eq!(*runtime.stop_pairing_calls.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn allowlisted_paired_devices_are_auto_trusted() {
+        let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
+        let mut config = OratorsConfig::default();
+        config.allow_device("AA");
+        let service = OratorsService::new(runtime, config);
+
+        let status = service.status_json().await.unwrap();
+        let status: orators_core::RuntimeStatus = serde_json::from_str(&status).unwrap();
+
+        assert!(status.devices[0].trusted);
+        assert!(status.devices[0].auto_reconnect);
     }
 }
