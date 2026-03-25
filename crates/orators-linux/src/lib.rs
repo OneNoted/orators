@@ -247,7 +247,7 @@ impl LinuxPlatform {
     async fn any_connected_audio_devices(&self) -> Result<bool> {
         Ok(self
             .bluez
-            .remote_devices()
+            .all_remote_devices()
             .await?
             .into_iter()
             .any(|device| device.connected && remote_device_supports_media(&device)))

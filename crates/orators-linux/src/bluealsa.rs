@@ -256,20 +256,20 @@ impl PlayerSupervisor {
                 if self.player_state == PlayerState::Starting {
                     self.player_state = PlayerState::Playing;
                 }
+                self.restart_attempts = 0;
+                self.next_restart_at = None;
             }
             Ok(Some(status)) => {
                 self.current = None;
                 self.player_state = PlayerState::Error;
                 self.last_error = Some(format!("bluealsa-aplay exited with status {status}"));
-                self.restart_attempts = self.restart_attempts.saturating_add(1);
-                self.next_restart_at = Some(Instant::now() + PLAYER_RESTART_BACKOFF);
+                self.record_player_failure();
             }
             Err(error) => {
                 self.current = None;
                 self.player_state = PlayerState::Error;
                 self.last_error = Some(format!("failed to inspect bluealsa-aplay: {error}"));
-                self.restart_attempts = self.restart_attempts.saturating_add(1);
-                self.next_restart_at = Some(Instant::now() + PLAYER_RESTART_BACKOFF);
+                self.record_player_failure();
             }
         }
 
@@ -291,6 +291,16 @@ impl PlayerSupervisor {
         }
 
         Ok(())
+    }
+
+    fn record_player_failure(&mut self) {
+        self.restart_attempts = self.restart_attempts.saturating_add(1);
+        let cooldown = if self.restart_attempts >= PLAYER_MAX_RESTARTS {
+            Duration::from_secs(30)
+        } else {
+            PLAYER_RESTART_BACKOFF
+        };
+        self.next_restart_at = Some(Instant::now() + cooldown);
     }
 }
 
@@ -324,9 +334,10 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 
+    use orators_core::PlayerState;
     use tempfile::tempdir;
 
-    use super::{BluealsaAssets, find_binary_in_path};
+    use super::{BluealsaAssets, PLAYER_MAX_RESTARTS, PlayerSupervisor, find_binary_in_path};
 
     #[test]
     fn finds_executable_in_path() {
@@ -390,5 +401,20 @@ mod tests {
         .unwrap();
 
         assert!(assets.bluealsad.starts_with(valid_dir.path()));
+    }
+
+    #[test]
+    fn repeated_player_failures_switch_to_long_cooldown() {
+        let mut supervisor = PlayerSupervisor {
+            player_state: PlayerState::Waiting,
+            ..PlayerSupervisor::default()
+        };
+
+        for _ in 0..PLAYER_MAX_RESTARTS {
+            supervisor.record_player_failure();
+        }
+
+        assert_eq!(supervisor.restart_attempts, PLAYER_MAX_RESTARTS);
+        assert!(supervisor.next_restart_at.is_some());
     }
 }

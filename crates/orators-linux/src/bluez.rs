@@ -125,6 +125,11 @@ impl BluetoothCtlBluez {
         ))
     }
 
+    pub async fn all_remote_devices(&self) -> Result<Vec<RemoteDeviceInfo>> {
+        let managed = self.managed_objects().await?;
+        Ok(parse_remote_devices(&managed, None))
+    }
+
     pub async fn powered_adapter_ids(&self) -> Result<Vec<String>> {
         let managed = self.managed_objects().await?;
         Ok(managed
@@ -706,8 +711,8 @@ mod tests {
 
     use super::{
         A2DP_SOURCE_UUID, AdapterInfo, AgentError, DeviceAuthorizationState, RemoteDeviceInfo,
-        authorize_device_state, parse_device, parse_transport_profile, path_has_adapter_segment,
-        remote_device_supports_media,
+        authorize_device_state, parse_device, parse_remote_devices, parse_transport_profile,
+        path_has_adapter_segment, remote_device_supports_media,
     };
 
     #[test]
@@ -857,5 +862,44 @@ mod tests {
             "/org/bluez/hci10/dev_AA_BB_CC_DD_EE_FF",
             "hci1"
         ));
+    }
+
+    #[test]
+    fn parse_remote_devices_without_preferred_adapter_sees_all_adapters() {
+        let device_props_hci0 = HashMap::from([
+            (
+                "Address".to_string(),
+                OwnedValue::from(Str::from("AA:BB:CC:DD:EE:FF")),
+            ),
+            ("Alias".to_string(), OwnedValue::from(Str::from("Phone"))),
+            ("Paired".to_string(), OwnedValue::from(true)),
+            ("Connected".to_string(), OwnedValue::from(true)),
+        ]);
+        let device_props_hci1 = HashMap::from([
+            (
+                "Address".to_string(),
+                OwnedValue::from(Str::from("AA:BB:CC:DD:EE:FF")),
+            ),
+            ("Alias".to_string(), OwnedValue::from(Str::from("Phone"))),
+            ("Paired".to_string(), OwnedValue::from(true)),
+            ("Connected".to_string(), OwnedValue::from(true)),
+        ]);
+
+        let managed = HashMap::from([
+            (
+                OwnedObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").unwrap(),
+                HashMap::from([("org.bluez.Device1".to_string(), device_props_hci0)]),
+            ),
+            (
+                OwnedObjectPath::try_from("/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF").unwrap(),
+                HashMap::from([("org.bluez.Device1".to_string(), device_props_hci1)]),
+            ),
+        ]);
+
+        let all_devices = parse_remote_devices(&managed, None);
+        let filtered_devices = parse_remote_devices(&managed, Some("hci1"));
+
+        assert_eq!(all_devices.len(), 2);
+        assert_eq!(filtered_devices.len(), 1);
     }
 }
