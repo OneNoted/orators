@@ -34,16 +34,15 @@ impl BluealsaAssets {
             });
         }
 
-        let packaged_error = Self::discover_in_packaged_dirs(PACKAGED_BLUEALSA_DIRS.iter().map(Path::new)).err();
-
-        let path = env::var_os("PATH").context("failed to find BlueALSA assets in PATH")?;
-        Self::discover_in_path(&path).map_err(|path_error| {
-            packaged_error.unwrap_or_else(|| {
-                anyhow::anyhow!(
-                    "failed to find `bluealsad`, `bluealsa-aplay`, and `bluealsactl` in PATH: {path_error}"
-                )
-            })
-        })
+        match Self::discover_in_packaged_dirs(PACKAGED_BLUEALSA_DIRS.iter().map(Path::new)) {
+            Ok(assets) => Ok(assets),
+            Err(packaged_error) => {
+                let path = env::var_os("PATH").context("failed to find BlueALSA assets in PATH")?;
+                Self::discover_in_path(&path).map_err(|path_error| {
+                    anyhow::anyhow!("{packaged_error}; {path_error}")
+                })
+            }
+        }
     }
 
     fn discover_in_path(path: &OsStr) -> Result<Self> {

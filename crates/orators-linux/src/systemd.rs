@@ -134,44 +134,43 @@ impl SystemdUserRuntime {
     }
 
     pub async fn uninstall_system_backend(&self) -> Result<()> {
-        let _ = self
-            .run_sudo(["systemctl", "disable", "--now", SYSTEM_BACKEND_UNIT])
-            .await;
-        let _ = self
-            .run_sudo(["systemctl", "disable", "--now", LEGACY_SYSTEM_BACKEND_UNIT])
-            .await;
-        let _ = self
-            .run_sudo([
-                "rm",
-                "-f",
-                system_backend_unit_path().to_string_lossy().as_ref(),
-            ])
-            .await;
-        let _ = self
-            .run_sudo([
-                "rm",
-                "-f",
-                system_backend_dbus_policy_path().to_string_lossy().as_ref(),
-            ])
-            .await;
-        let _ = self
-            .run_sudo([
-                "rm",
-                "-f",
-                legacy_system_backend_unit_path().to_string_lossy().as_ref(),
-            ])
-            .await;
-        let _ = self
-            .run_sudo([
-                "busctl",
-                "call",
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                "org.freedesktop.DBus",
-                "ReloadConfig",
-            ])
-            .await;
-        let _ = self.run_sudo(["systemctl", "daemon-reload"]).await;
+        self.run_sudo_allow_missing(["systemctl", "disable", "--now", SYSTEM_BACKEND_UNIT])
+            .await?;
+        self.run_sudo_allow_missing([
+            "systemctl",
+            "disable",
+            "--now",
+            LEGACY_SYSTEM_BACKEND_UNIT,
+        ])
+        .await?;
+        self.run_sudo([
+            "rm",
+            "-f",
+            system_backend_unit_path().to_string_lossy().as_ref(),
+        ])
+        .await?;
+        self.run_sudo([
+            "rm",
+            "-f",
+            system_backend_dbus_policy_path().to_string_lossy().as_ref(),
+        ])
+        .await?;
+        self.run_sudo([
+            "rm",
+            "-f",
+            legacy_system_backend_unit_path().to_string_lossy().as_ref(),
+        ])
+        .await?;
+        self.run_sudo([
+            "busctl",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ReloadConfig",
+        ])
+        .await?;
+        self.run_sudo(["systemctl", "daemon-reload"]).await?;
 
         let fragment_path = wireplumber_fragment_path()?;
         if fragment_path.exists() {
@@ -287,6 +286,21 @@ impl SystemdUserRuntime {
         }
 
         Ok(())
+    }
+
+    async fn run_sudo_allow_missing<const N: usize>(&self, args: [&str; N]) -> Result<()> {
+        match self.run_sudo(args).await {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error.to_string().contains("No such file")
+                    || error.to_string().contains("not loaded")
+                    || error.to_string().contains("not-found")
+                    || error.to_string().contains("could not be found") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn rollback_failed_install(&self, fragment_path: &Path) -> Result<()> {
