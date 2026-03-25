@@ -12,7 +12,9 @@ impl LocalAudioRuntime {
     pub async fn current_defaults(&self) -> Result<AudioDefaults> {
         let output_device = inspect_wpctl("@DEFAULT_AUDIO_SINK@").await.ok();
         let input_device = inspect_wpctl("@DEFAULT_AUDIO_SOURCE@").await.ok();
-        let local_output_available = output_device.is_some();
+        let local_output_available = output_device
+            .as_deref()
+            .is_some_and(|device| !is_dummy_output_name(device));
 
         Ok(AudioDefaults {
             output_device,
@@ -20,6 +22,10 @@ impl LocalAudioRuntime {
             local_output_available,
         })
     }
+}
+
+fn is_dummy_output_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Dummy Output")
 }
 
 async fn inspect_wpctl(target: &str) -> Result<String> {
@@ -60,7 +66,7 @@ async fn run_command(program: &str, args: &[&str]) -> Result<Output> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_wpctl_inspect;
+    use super::{is_dummy_output_name, parse_wpctl_inspect};
 
     #[test]
     fn parses_wpctl_inspect_output() {
@@ -72,5 +78,12 @@ id 42, type PipeWire:Interface:Node
         );
 
         assert_eq!(parsed.as_deref(), Some("RODECaster Pro II"));
+    }
+
+    #[test]
+    fn detects_dummy_output_name() {
+        assert!(is_dummy_output_name("Dummy Output"));
+        assert!(is_dummy_output_name("dummy output"));
+        assert!(!is_dummy_output_name("RODECaster Pro II"));
     }
 }

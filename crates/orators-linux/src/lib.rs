@@ -97,7 +97,10 @@ impl LinuxPlatform {
 
     pub async fn backend_status(&self) -> Result<MediaBackendStatus> {
         let installed = self.systemd.wireplumber_fragment_installed()?;
-        let service_ready = self.system_backend_ready().await?.is_some();
+        let service_status = self.system_backend_status().await?;
+        let service_ready = service_status
+            .as_ref()
+            .is_some_and(|status| status.active_state == "active" && status.sub_state == "running");
         Ok(self.bluealsa.backend_status(installed, service_ready).await)
     }
 
@@ -111,10 +114,15 @@ impl LinuxPlatform {
 
     pub async fn reconcile_runtime(&self) -> Result<()> {
         let installed = self.systemd.wireplumber_fragment_installed()?;
-        let Some(_service_status) = self.system_backend_ready().await? else {
+        let Some(service_status) = self.system_backend_status().await? else {
             self.bluealsa.stop_player().await?;
             return Ok(());
         };
+
+        if service_status.active_state != "active" || service_status.sub_state != "running" {
+            self.bluealsa.stop_player().await?;
+            return Ok(());
+        }
 
         if !installed {
             self.bluealsa.stop_player().await?;
@@ -141,7 +149,7 @@ impl LinuxPlatform {
             &self.audio,
             &self.systemd,
             self.config.adapter.as_deref(),
-            self.system_backend_ready().await?,
+            self.system_backend_status().await?,
         )
         .await
     }
@@ -187,9 +195,17 @@ impl LinuxPlatform {
 
         BluealsaAssets::discover().context("BlueALSA binaries are not available")?;
 
-        self.system_backend_ready()
+        let backend_status = self
+            .system_backend_status()
             .await?
-            .context("the Orators BlueALSA system service is not healthy")?;
+            .context("the Orators BlueALSA system service is not installed")?;
+        if backend_status.active_state != "active" || backend_status.sub_state != "running" {
+            anyhow::bail!(
+                "the Orators BlueALSA system service is not healthy: ActiveState={}, SubState={}",
+                backend_status.active_state,
+                backend_status.sub_state
+            );
+        }
 
         let defaults = self.audio.current_defaults().await?;
         if !defaults.local_output_available {
@@ -199,16 +215,13 @@ impl LinuxPlatform {
         Ok(())
     }
 
-    async fn system_backend_ready(&self) -> Result<Option<ServiceStatus>> {
+    async fn system_backend_status(&self) -> Result<Option<ServiceStatus>> {
         match self
             .systemd
             .system_service_status(SYSTEM_BACKEND_UNIT)
             .await
         {
-            Ok(status) if status.active_state == "active" && status.sub_state == "running" => {
-                Ok(Some(status))
-            }
-            Ok(_) => Ok(None),
+            Ok(status) => Ok(Some(status)),
             Err(error) if error.to_string().contains("could not be found") => Ok(None),
             Err(error) if error.to_string().contains("not-found") => Ok(None),
             Err(error) => Err(error),

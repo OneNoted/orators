@@ -240,13 +240,13 @@ async fn install_user_service(json: bool) -> Result<()> {
 async fn install_system_backend(json: bool, adapter: Option<String>) -> Result<()> {
     let config_path = default_config_path()?;
     let mut config = ensure_config_exists(&config_path)?;
+    let mut effective_config = config.clone();
     if let Some(adapter) = adapter.clone() {
-        config.adapter = Some(adapter.to_ascii_lowercase());
-        config.save(&config_path)?;
+        effective_config.adapter = Some(adapter.to_ascii_lowercase());
     }
 
     let daemon_path = resolve_daemon_path()?;
-    let runtime = LinuxPlatform::new(config.clone()).await?;
+    let runtime = LinuxPlatform::new(effective_config).await?;
     let user_unit_path = runtime.install_user_service(&daemon_path).await?;
     let install = runtime.install_system_backend(adapter.as_deref()).await?;
 
