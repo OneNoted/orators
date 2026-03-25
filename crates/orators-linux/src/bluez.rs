@@ -17,6 +17,7 @@ const BLUEZ_SERVICE: &str = "org.bluez";
 const BLUEZ_ROOT_PATH: &str = "/";
 const AGENT_MANAGER_PATH: &str = "/org/bluez";
 const AGENT_PATH: &str = "/dev/orators/bluez/agent";
+const A2DP_SINK_UUID: &str = "0000110b-0000-1000-8000-00805f9b34fb";
 const NO_INPUT_NO_OUTPUT: &str = "NoInputNoOutput";
 
 type InterfaceProperties = HashMap<String, HashMap<String, OwnedValue>>;
@@ -235,9 +236,9 @@ impl BluetoothCtlBluez {
         .await
         .with_context(|| format!("failed to create BlueZ device proxy for {address}"))?;
         device
-            .call_method("Connect", &())
+            .call_method("ConnectProfile", &(A2DP_SINK_UUID))
             .await
-            .with_context(|| format!("failed to connect device {address}"))?;
+            .with_context(|| format!("failed to connect A2DP profile for device {address}"))?;
         Ok(())
     }
 

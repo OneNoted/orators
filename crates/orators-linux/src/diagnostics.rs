@@ -4,14 +4,12 @@ use orators_core::{DiagnosticCheck, DiagnosticsReport, Severity};
 use crate::{
     audio::{BluetoothCard, BluetoothRuntimeSettings, PipeWireDefaults, WpctlAudioRuntime},
     bluez::{AdapterInfo, BluetoothCtlBluez},
-    owned_backend::OwnedBluetoothMediaBackend,
-    systemd::{ManagedBackendStatus, SystemdUserRuntime, UserServiceStatus},
+    systemd::{SystemdUserRuntime, UserServiceStatus},
 };
 
 pub async fn collect_report(
     bluez: &BluetoothCtlBluez,
     audio: &WpctlAudioRuntime,
-    owned_backend: Option<&OwnedBluetoothMediaBackend>,
     systemd: &SystemdUserRuntime,
 ) -> Result<DiagnosticsReport> {
     let mut checks = Vec::new();
@@ -56,23 +54,15 @@ pub async fn collect_report(
     let wireplumber = systemd.service_status("wireplumber.service").await.ok();
     checks.push(wireplumber_check(wireplumber.as_ref()));
 
-    let backend = systemd.managed_backend_status().await.ok();
-    checks.push(managed_backend_check(backend.as_ref()));
-    let runtime_backend = if let Some(backend) = owned_backend {
-        Some(backend.snapshot().await)
-    } else {
-        None
-    };
-    checks.push(owned_backend_runtime_check(
-        backend.as_ref(),
-        runtime_backend.as_ref(),
-    ));
-
     let defaults = audio.pipewire_defaults().await.ok();
     checks.push(pipewire_defaults_check(defaults.as_ref()));
 
     let runtime_settings = audio.bluetooth_runtime_settings().await.ok();
     checks.push(headset_autoswitch_check(runtime_settings.as_ref()));
+    checks.push(device_restore_profile_check(runtime_settings.as_ref()));
+    checks.push(bluetooth_persistent_storage_check(
+        runtime_settings.as_ref(),
+    ));
 
     let bluetooth_cards = audio.bluetooth_cards().await.ok();
     let active_device = bluez
@@ -89,77 +79,12 @@ pub async fn collect_report(
         adapter_info.as_ref(),
         defaults.as_ref(),
         wireplumber.as_ref(),
-        backend.as_ref(),
     ));
 
     Ok(DiagnosticsReport {
         generated_at_epoch_secs: crate::now_epoch_secs(),
         checks,
     })
-}
-
-fn owned_backend_runtime_check(
-    install_status: Option<&ManagedBackendStatus>,
-    runtime_status: Option<&crate::owned_backend::OwnedBackendSnapshot>,
-) -> DiagnosticCheck {
-    if let Some(runtime) = runtime_status {
-        return DiagnosticCheck {
-            code: "orators.backend_runtime".to_string(),
-            severity: if runtime.endpoints_registered {
-                Severity::Info
-            } else {
-                Severity::Warn
-            },
-            summary: if runtime.endpoints_registered {
-                "Orators owns the Bluetooth media endpoint registration".to_string()
-            } else {
-                "Orators started without registering Bluetooth media endpoints".to_string()
-            },
-            detail: Some(format!(
-                "endpoints_registered={}, active_codec={}, transport_acquired={}, playback_connected={}.{}",
-                runtime.endpoints_registered,
-                runtime
-                    .active_codec
-                    .map(|codec| format!("{codec:?}").to_lowercase())
-                    .unwrap_or_else(|| "none".to_string()),
-                runtime.transport_acquired,
-                runtime.playback_connected,
-                runtime
-                    .last_error
-                    .as_ref()
-                    .map(|error| format!(" last_error={error}"))
-                    .unwrap_or_default()
-            )),
-            remediation: (!runtime.endpoints_registered).then_some(
-                "Check BlueZ logs and confirm the managed backend is installed before expecting Orators-owned Bluetooth playback."
-                    .to_string(),
-            ),
-        };
-    }
-
-    DiagnosticCheck {
-        code: "orators.backend_runtime".to_string(),
-        severity: if install_status.is_some_and(|status| status.installed) {
-            Severity::Warn
-        } else {
-            Severity::Info
-        },
-        summary: if install_status.is_some_and(|status| status.installed) {
-            "The managed backend is installed, but the owned Bluetooth runtime is not active in this daemon instance".to_string()
-        } else {
-            "The owned Bluetooth runtime is not active".to_string()
-        },
-        detail: Some(
-            "Orators only starts its BlueZ MediaEndpoint backend when the managed `wireplumber -p audio` install is active before daemon startup."
-                .to_string(),
-        ),
-        remediation: install_status
-            .is_some_and(|status| status.installed)
-            .then_some(
-                "Restart `oratorsd.service` after activating the managed backend so Orators can register its endpoints."
-                    .to_string(),
-            ),
-    }
 }
 
 fn media_role_check(adapter: Option<&AdapterInfo>) -> DiagnosticCheck {
@@ -254,62 +179,6 @@ fn wireplumber_check(status: Option<&UserServiceStatus>) -> DiagnosticCheck {
     }
 }
 
-fn managed_backend_check(status: Option<&ManagedBackendStatus>) -> DiagnosticCheck {
-    match status {
-        Some(status) if status.installed && status.wireplumber_audio_profile => DiagnosticCheck {
-            code: "orators.backend_install".to_string(),
-            severity: Severity::Info,
-            summary: "The managed Orators Bluetooth-audio backend is installed".to_string(),
-            detail: Some(format!(
-                "wireplumber.service override is present at {} and the live ExecStart currently includes `-p audio`.",
-                status.wireplumber_dropin_path.display()
-            )),
-            remediation: None,
-        },
-        Some(status) if status.installed => DiagnosticCheck {
-            code: "orators.backend_install".to_string(),
-            severity: Severity::Warn,
-            summary: "The managed backend files are installed, but WirePlumber is not yet in audio-only mode".to_string(),
-            detail: Some(format!(
-                "Expected override at {}. The daemon unit exists at {}.",
-                status.wireplumber_dropin_path.display(),
-                status.unit_path.display()
-            )),
-            remediation: Some(
-                "Restart `wireplumber.service` and `oratorsd.service` while no Bluetooth audio devices are connected."
-                    .to_string(),
-            ),
-        },
-        Some(status) => DiagnosticCheck {
-            code: "orators.backend_install".to_string(),
-            severity: Severity::Warn,
-            summary: "The managed Orators Bluetooth-audio backend is not installed".to_string(),
-            detail: Some(format!(
-                "Expected daemon unit at {} and WirePlumber override at {}.",
-                status.unit_path.display(),
-                status.wireplumber_dropin_path.display()
-            )),
-            remediation: Some(
-                "Run `oratorsctl install-host-backend` before relying on the owned-backend MVP path."
-                    .to_string(),
-            ),
-        },
-        None => DiagnosticCheck {
-            code: "orators.backend_install".to_string(),
-            severity: Severity::Warn,
-            summary: "The managed backend installation could not be inspected".to_string(),
-            detail: Some(
-                "Orators could not determine whether its wireplumber.service override is installed."
-                    .to_string(),
-            ),
-            remediation: Some(
-                "Run `oratorsctl install-host-backend` if you want Orators to own Bluetooth audio instead of the stock WirePlumber Bluetooth path."
-                    .to_string(),
-            ),
-        },
-    }
-}
-
 fn pipewire_defaults_check(defaults: Option<&PipeWireDefaults>) -> DiagnosticCheck {
     match defaults {
         Some(defaults) if defaults.output_device.is_some() && !defaults.output_is_dummy => {
@@ -373,7 +242,7 @@ fn headset_autoswitch_check(settings: Option<&BluetoothRuntimeSettings>) -> Diag
                     .to_string(),
             ),
             remediation: Some(
-                "Orators will disable this setting at runtime before pairing or connecting devices."
+                "If this host starts switching profiles on its own, disable the setting in WirePlumber outside Orators."
                     .to_string(),
             ),
         },
@@ -383,6 +252,89 @@ fn headset_autoswitch_check(settings: Option<&BluetoothRuntimeSettings>) -> Diag
             summary: "Bluetooth headset autoswitch state could not be inspected".to_string(),
             detail: Some(
                 "wpctl could not read the `bluetooth.autoswitch-to-headset-profile` runtime setting."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "Make sure WirePlumber is healthy before using Orators with Bluetooth audio."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn device_restore_profile_check(settings: Option<&BluetoothRuntimeSettings>) -> DiagnosticCheck {
+    match settings.and_then(|settings| settings.device_restore_profile) {
+        Some(false) => DiagnosticCheck {
+            code: "wireplumber.device_restore_profile".to_string(),
+            severity: Severity::Info,
+            summary: "Bluetooth profile restore is disabled at runtime".to_string(),
+            detail: Some(
+                "WirePlumber will not restore a previous headset profile for Bluetooth devices, which keeps the Fold7 on the stable media profile instead of drifting back to audio-gateway."
+                    .to_string(),
+            ),
+            remediation: None,
+        },
+        Some(true) => DiagnosticCheck {
+            code: "wireplumber.device_restore_profile".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth profile restore is enabled at runtime".to_string(),
+            detail: Some(
+                "WirePlumber may restore a previously selected headset profile on reconnect, which can drag media-only devices back into the wrong Bluetooth mode."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "If Bluetooth devices keep reconnecting in the wrong profile, disable profile restore at runtime."
+                    .to_string(),
+            ),
+        },
+        None => DiagnosticCheck {
+            code: "wireplumber.device_restore_profile".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth profile restore state could not be inspected".to_string(),
+            detail: Some(
+                "wpctl could not read the `device.restore-profile` runtime setting.".to_string(),
+            ),
+            remediation: Some(
+                "Make sure WirePlumber is healthy before using Orators with Bluetooth audio."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn bluetooth_persistent_storage_check(
+    settings: Option<&BluetoothRuntimeSettings>,
+) -> DiagnosticCheck {
+    match settings.and_then(|settings| settings.bluetooth_persistent_storage) {
+        Some(false) => DiagnosticCheck {
+            code: "wireplumber.bluetooth_persistent_storage".to_string(),
+            severity: Severity::Info,
+            summary: "Bluetooth persistent storage is disabled at runtime".to_string(),
+            detail: Some(
+                "WirePlumber will not reuse saved Bluetooth state for reconnects, which avoids replaying stale headset selections on this host."
+                    .to_string(),
+            ),
+            remediation: None,
+        },
+        Some(true) => DiagnosticCheck {
+            code: "wireplumber.bluetooth_persistent_storage".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth persistent storage is enabled at runtime".to_string(),
+            detail: Some(
+                "Saved Bluetooth state can bring back a previously unstable profile choice when the device reconnects."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "If the Bluetooth profile keeps drifting after reconnects, disable persistent storage at runtime."
+                    .to_string(),
+            ),
+        },
+        None => DiagnosticCheck {
+            code: "wireplumber.bluetooth_persistent_storage".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth persistent storage state could not be inspected".to_string(),
+            detail: Some(
+                "wpctl could not read the `bluetooth.use-persistent-storage` runtime setting."
                     .to_string(),
             ),
             remediation: Some(
@@ -474,15 +426,12 @@ fn host_support_check(
     adapter: Option<&AdapterInfo>,
     defaults: Option<&PipeWireDefaults>,
     wireplumber: Option<&UserServiceStatus>,
-    backend: Option<&ManagedBackendStatus>,
 ) -> DiagnosticCheck {
     let ready = adapter.is_some_and(adapter_supports_media)
         && defaults
             .is_some_and(|defaults| defaults.output_device.is_some() && !defaults.output_is_dummy)
         && wireplumber
             .is_some_and(|status| status.active_state == "active" && status.sub_state == "running");
-    let owned_backend_ready =
-        backend.is_some_and(|status| status.installed && status.wireplumber_audio_profile);
 
     DiagnosticCheck {
         code: "host.media_support".to_string(),
@@ -496,13 +445,10 @@ fn host_support_check(
         } else {
             "This host is not ready for config-free Bluetooth speaker playback".to_string()
         },
-        detail: Some(if owned_backend_ready {
-            "The desktop audio session is healthy and the managed WirePlumber audio-only profile is active. This is the intended direction for the app-owned Bluetooth media backend."
-                .to_string()
-        } else {
-            "The desktop audio session is healthy enough for the current stock-host runtime path, but the managed owned-backend install is not fully active yet."
-                .to_string()
-        }),
+        detail: Some(
+            "Orators now stays out of PipeWire/WirePlumber Bluetooth ownership and only checks the host audio session read-only."
+                .to_string(),
+        ),
         remediation: (!ready).then_some(
             "Fix the host audio stack first. Orators will refuse pairing or connection attempts on unsupported or unhealthy hosts."
                 .to_string(),

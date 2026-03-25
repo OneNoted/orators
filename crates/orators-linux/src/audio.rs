@@ -1,6 +1,6 @@
 use std::{process::Output, time::Duration};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use orators_core::{AudioDefaults, BluetoothProfile};
 use serde_json::Value;
 use tokio::process::Command;
@@ -9,6 +9,8 @@ pub struct WpctlAudioRuntime;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const HEADSET_AUTOSWITCH_SETTING: &str = "bluetooth.autoswitch-to-headset-profile";
+const DEVICE_RESTORE_PROFILE_SETTING: &str = "device.restore-profile";
+const BLUETOOTH_PERSISTENT_STORAGE_SETTING: &str = "bluetooth.use-persistent-storage";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipeWireDefaults {
@@ -20,6 +22,8 @@ pub struct PipeWireDefaults {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BluetoothRuntimeSettings {
     pub headset_autoswitch: Option<bool>,
+    pub device_restore_profile: Option<bool>,
+    pub bluetooth_persistent_storage: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,120 +120,57 @@ impl WpctlAudioRuntime {
             .context("failed to parse pw-dump Bluetooth cards")
     }
 
-    pub async fn pin_device_to_a2dp(&self, address: &str) -> Result<()> {
-        let card = self
-            .wait_for_bluetooth_card(address, 20, Duration::from_millis(500))
-            .await?;
-        self.pin_card_to_a2dp(&card).await
-    }
-
-    pub async fn guard_active_device_audio(&self, address: &str) -> Result<()> {
-        let defaults = self.pipewire_defaults().await?;
-        if defaults.output_device.is_none() || defaults.output_is_dummy {
-            anyhow::bail!("PipeWire default sink is unavailable");
-        }
-
-        let card = self.find_bluetooth_card(address).await?;
-        if card
-            .active_profile_name
-            .as_deref()
-            .is_some_and(is_a2dp_profile_name)
-        {
-            return Ok(());
-        }
-
-        self.pin_card_to_a2dp(&card).await?;
-        let refreshed = self.find_bluetooth_card(address).await?;
-        if refreshed
-            .active_profile_name
-            .as_deref()
-            .is_some_and(is_a2dp_profile_name)
-        {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "Bluetooth audio profile drifted away from A2DP and could not be restored"
-            )
-        }
-    }
-
     pub async fn bluetooth_runtime_settings(&self) -> Result<BluetoothRuntimeSettings> {
-        let output = run_command("wpctl", &["settings", HEADSET_AUTOSWITCH_SETTING]).await?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "wpctl settings {HEADSET_AUTOSWITCH_SETTING} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
         Ok(BluetoothRuntimeSettings {
-            headset_autoswitch: parse_wpctl_setting_bool(&String::from_utf8_lossy(&output.stdout)),
+            headset_autoswitch: self
+                .read_runtime_setting_bool(HEADSET_AUTOSWITCH_SETTING)
+                .await?,
+            device_restore_profile: self
+                .read_runtime_setting_bool(DEVICE_RESTORE_PROFILE_SETTING)
+                .await?,
+            bluetooth_persistent_storage: self
+                .read_runtime_setting_bool(BLUETOOTH_PERSISTENT_STORAGE_SETTING)
+                .await?,
         })
     }
 
-    pub async fn disable_headset_autoswitch(&self) -> Result<()> {
-        let output =
-            run_command("wpctl", &["settings", HEADSET_AUTOSWITCH_SETTING, "false"]).await?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "wpctl settings {HEADSET_AUTOSWITCH_SETTING} false failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+    pub async fn apply_media_stability_settings(&self) -> Result<()> {
+        self.set_runtime_setting(HEADSET_AUTOSWITCH_SETTING, false)
+            .await?;
+        self.set_runtime_setting(DEVICE_RESTORE_PROFILE_SETTING, false)
+            .await?;
+        self.set_runtime_setting(BLUETOOTH_PERSISTENT_STORAGE_SETTING, false)
+            .await?;
         Ok(())
     }
 
-    async fn find_bluetooth_card(&self, address: &str) -> Result<BluetoothCard> {
-        self.bluetooth_cards()
-            .await?
-            .into_iter()
-            .find(|card| card_matches_address(card, address))
-            .ok_or_else(|| anyhow!("no PipeWire Bluetooth audio card was found for {address}"))
-    }
-
-    async fn wait_for_bluetooth_card(
-        &self,
-        address: &str,
-        attempts: usize,
-        sleep: Duration,
-    ) -> Result<BluetoothCard> {
-        for _ in 0..attempts {
-            if let Ok(card) = self.find_bluetooth_card(address).await {
-                return Ok(card);
-            }
-            tokio::time::sleep(sleep).await;
-        }
-
-        Err(anyhow!(
-            "BlueZ connected {address}, but no PipeWire Bluetooth audio card appeared"
-        ))
-    }
-
-    async fn pin_card_to_a2dp(&self, card: &BluetoothCard) -> Result<()> {
-        let profile = card
-            .available_profiles
-            .iter()
-            .find(|profile| is_a2dp_profile_name(&profile.name))
-            .ok_or_else(|| {
-                anyhow!(
-                    "no A2DP profile is available on Bluetooth card {}",
-                    card.name
-                )
-            })?;
-
-        let card_id = card.id.to_string();
-        let profile_index = profile.index.to_string();
-        let output = run_command("wpctl", &["set-profile", &card_id, &profile_index]).await?;
-
+    async fn read_runtime_setting_bool(&self, key: &str) -> Result<Option<bool>> {
+        let output = run_command("wpctl", &["settings", key]).await?;
         if !output.status.success() {
             anyhow::bail!(
-                "wpctl set-profile {} {} failed: {}",
-                card.id,
-                profile.index,
+                "wpctl settings {key} failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
 
+        Ok(parse_wpctl_setting_bool(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
+    async fn set_runtime_setting(&self, key: &str, value: bool) -> Result<()> {
+        let output = run_command(
+            "wpctl",
+            &["settings", key, if value { "true" } else { "false" }],
+        )
+        .await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "wpctl settings {key} {} failed: {}",
+                if value { "true" } else { "false" },
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         Ok(())
     }
 }

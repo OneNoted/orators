@@ -1,7 +1,6 @@
 pub mod audio;
 pub mod bluez;
 pub mod diagnostics;
-pub mod owned_backend;
 pub mod systemd;
 
 use std::path::{Path, PathBuf};
@@ -10,39 +9,23 @@ use anyhow::Result;
 use orators_core::{AudioDefaults, DeviceInfo, DiagnosticsReport, OratorsConfig};
 
 use crate::{
-    audio::WpctlAudioRuntime,
-    bluez::BluetoothCtlBluez,
-    diagnostics::collect_report,
-    owned_backend::OwnedBluetoothMediaBackend,
-    systemd::{ManagedBackendStatus, SystemdUserRuntime},
+    audio::WpctlAudioRuntime, bluez::BluetoothCtlBluez, diagnostics::collect_report,
+    systemd::SystemdUserRuntime,
 };
 
 pub struct LinuxPlatform {
     bluez: BluetoothCtlBluez,
     audio: WpctlAudioRuntime,
-    owned_backend: Option<OwnedBluetoothMediaBackend>,
     systemd: SystemdUserRuntime,
     config: OratorsConfig,
 }
 
 impl LinuxPlatform {
     pub async fn new(config: OratorsConfig) -> Result<Self> {
-        let systemd = SystemdUserRuntime;
-        let managed_backend = systemd.managed_backend_status().await.ok();
-        let owned_backend = if managed_backend
-            .as_ref()
-            .is_some_and(|status| status.installed && status.wireplumber_audio_profile)
-        {
-            Some(OwnedBluetoothMediaBackend::new().await?)
-        } else {
-            None
-        };
-
         Ok(Self {
             bluez: BluetoothCtlBluez::new().await?,
             audio: WpctlAudioRuntime,
-            owned_backend,
-            systemd,
+            systemd: SystemdUserRuntime,
             config,
         })
     }
@@ -74,12 +57,7 @@ impl LinuxPlatform {
 
     pub async fn connect_device(&self, address: &str) -> Result<()> {
         self.ensure_host_media_ready().await?;
-        self.bluez.connect_device(address).await?;
-        if self.owned_backend.is_some() {
-            Ok(())
-        } else {
-            self.audio.pin_device_to_a2dp(address).await
-        }
+        self.bluez.connect_device(address).await
     }
 
     pub async fn disconnect_device(&self, address: &str) -> Result<()> {
@@ -96,7 +74,7 @@ impl LinuxPlatform {
             .and_then(|devices| devices.into_iter().find(|device| device.connected))
             .map(|device| device.address);
 
-        let mut defaults = self
+        let defaults = self
             .audio
             .current_defaults(
                 adapter.as_ref().is_some_and(adapter_supports_media),
@@ -104,9 +82,6 @@ impl LinuxPlatform {
                 active_device.as_deref(),
             )
             .await?;
-        if self.owned_backend.is_some() {
-            defaults.call_roles_detected = false;
-        }
         Ok(defaults)
     }
 
@@ -132,50 +107,36 @@ impl LinuxPlatform {
             anyhow::bail!("PipeWire does not currently have a usable default sink");
         }
 
-        self.audio.disable_headset_autoswitch().await?;
+        self.audio.apply_media_stability_settings().await?;
 
         Ok(())
     }
 
     pub async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()> {
-        if let Some(address) = active_device {
+        if active_device.is_some() {
             let wireplumber = self.systemd.service_status("wireplumber.service").await?;
             if wireplumber.active_state != "active" || wireplumber.sub_state != "running" {
                 anyhow::bail!(
                     "wireplumber.service became unhealthy while Bluetooth audio was active"
                 );
             }
-
-            self.audio.guard_active_device_audio(address).await?;
+            let defaults = self.audio.pipewire_defaults().await?;
+            if defaults.output_device.is_none() || defaults.output_is_dummy {
+                anyhow::bail!(
+                    "PipeWire default sink is unavailable while Bluetooth audio is active"
+                );
+            }
         }
 
         Ok(())
     }
 
     pub async fn diagnostics(&self) -> Result<DiagnosticsReport> {
-        collect_report(
-            &self.bluez,
-            &self.audio,
-            self.owned_backend.as_ref(),
-            &self.systemd,
-        )
-        .await
+        collect_report(&self.bluez, &self.audio, &self.systemd).await
     }
 
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {
         self.systemd.install_user_service(daemon_path).await
-    }
-
-    pub async fn install_host_backend(&self, daemon_path: &Path) -> Result<ManagedBackendStatus> {
-        self.systemd.install_host_backend(daemon_path).await
-    }
-
-    pub async fn uninstall_host_backend(&self) -> Result<()> {
-        self.systemd.uninstall_host_backend().await
-    }
-
-    pub async fn managed_backend_status(&self) -> Result<ManagedBackendStatus> {
-        self.systemd.managed_backend_status().await
     }
 }
 

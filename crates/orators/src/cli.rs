@@ -30,8 +30,6 @@ pub enum Command {
     Connect { mac: String },
     Disconnect,
     Doctor,
-    InstallHostBackend,
-    UninstallHostBackend,
     InstallUserService,
 }
 
@@ -67,8 +65,6 @@ pub enum DeviceCommand {
 
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::InstallHostBackend => install_host_backend(cli.json).await,
-        Command::UninstallHostBackend => uninstall_host_backend(cli.json).await,
         Command::InstallUserService => install_user_service(cli.json).await,
         Command::Doctor => run_doctor(cli.json).await,
         command => run_daemon_command(command, cli.json).await,
@@ -150,10 +146,7 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
             let output = client.disconnect_active().await?;
             render_status_output(output, json, "Disconnect request sent.")?;
         }
-        Command::Doctor
-        | Command::InstallUserService
-        | Command::InstallHostBackend
-        | Command::UninstallHostBackend => unreachable!(),
+        Command::Doctor | Command::InstallUserService => unreachable!(),
     }
     Ok(())
 }
@@ -181,68 +174,7 @@ async fn install_user_service(json: bool) -> Result<()> {
         println!("{}", unit_path.display());
     } else {
         println!("Installed user service at {}.", unit_path.display());
-        println!(
-            "This only installs the daemon unit. For the owned-backend MVP path, use `oratorsctl install-host-backend`."
-        );
-    }
-    Ok(())
-}
-
-async fn install_host_backend(json: bool) -> Result<()> {
-    let config_path = default_config_path()?;
-    let config = ensure_config_exists(&config_path)?;
-    let daemon_path = resolve_daemon_path()?;
-    let runtime = std::sync::Arc::new(orators_linux::LinuxPlatform::new(config.clone()).await?);
-    let service = crate::service::OratorsService::new(runtime, config);
-    let status = service.install_host_backend(&daemon_path).await?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "installed": status.installed,
-                "wireplumber_audio_profile": status.wireplumber_audio_profile,
-                "unit_path": status.unit_path,
-                "wireplumber_dropin_path": status.wireplumber_dropin_path,
-            }))?
-        );
-    } else {
-        println!("Installed the managed host backend.");
-        println!("Orators service: {}", status.unit_path.display());
-        println!(
-            "WirePlumber override: {}",
-            status.wireplumber_dropin_path.display()
-        );
-        println!(
-            "WirePlumber audio profile active now: {}",
-            yes_no(status.wireplumber_audio_profile)
-        );
-        println!(
-            "Next step: restart `wireplumber.service` and `oratorsd.service` when no Bluetooth audio devices are connected."
-        );
-    }
-    Ok(())
-}
-
-async fn uninstall_host_backend(json: bool) -> Result<()> {
-    let config_path = default_config_path()?;
-    let config = ensure_config_exists(&config_path)?;
-    let runtime = std::sync::Arc::new(orators_linux::LinuxPlatform::new(config.clone()).await?);
-    let service = crate::service::OratorsService::new(runtime, config);
-    service.uninstall_host_backend().await?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "uninstalled": true
-            }))?
-        );
-    } else {
-        println!("Removed the managed host backend.");
-        println!(
-            "Next step: restart `wireplumber.service` when no Bluetooth audio devices are connected to restore the stock session-manager profile."
-        );
+        println!("This only installs the daemon unit.");
     }
     Ok(())
 }
@@ -404,9 +336,6 @@ fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&Diagnostics
     if let Some(summary) = diagnostics.and_then(host_support_summary) {
         println!("Host readiness: {summary}");
     }
-    if let Some(summary) = diagnostics.and_then(backend_summary) {
-        println!("Managed backend: {summary}");
-    }
 }
 
 fn render_doctor(report: &DiagnosticsReport) {
@@ -448,11 +377,6 @@ fn find_check<'a>(report: &'a DiagnosticsReport, code: &str) -> Option<&'a Diagn
 
 fn host_support_summary(report: &DiagnosticsReport) -> Option<&str> {
     let check = find_check(report, "host.media_support")?;
-    check.detail.as_deref().or(Some(check.summary.as_str()))
-}
-
-fn backend_summary(report: &DiagnosticsReport) -> Option<&str> {
-    let check = find_check(report, "orators.backend_install")?;
     check.detail.as_deref().or(Some(check.summary.as_str()))
 }
 
@@ -604,9 +528,7 @@ async fn ensure_daemon_running(connection: &Connection) -> Result<()> {
     SystemdUserRuntime
         .start_orators_service()
         .await
-        .context(
-            "failed to start oratorsd.service; run `oratorsctl install-host-backend` or `oratorsctl install-user-service` first",
-        )?;
+        .context("failed to start oratorsd.service; run `oratorsctl install-user-service` first")?;
 
     for _ in 0..12 {
         if bus
@@ -626,8 +548,6 @@ fn explain_dbus_error(action: &str, error: zbus::Error) -> anyhow::Error {
     let detail = error.to_string();
     let next_step = if detail.contains("pairing window is closed") {
         "Run `oratorsctl pair start --timeout 120` before pairing a new device."
-    } else if detail.contains("managed host backend") {
-        "Run `oratorsctl install-host-backend`, then restart `wireplumber.service` and `oratorsd.service` with no Bluetooth audio devices connected."
     } else if detail.contains("does not advertise Audio Sink / A2DP media support") {
         "Run `oratorsctl doctor` and fix the host Bluetooth audio stack outside Orators."
     } else if detail.contains("usable default sink") || detail.contains("wireplumber.service") {
