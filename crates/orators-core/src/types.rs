@@ -7,6 +7,48 @@ pub enum BluetoothProfile {
     Call,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaBackendKind {
+    #[default]
+    Bluealsa,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerState {
+    #[default]
+    Waiting,
+    Starting,
+    Playing,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaBackendStatus {
+    pub backend: MediaBackendKind,
+    pub installed: bool,
+    pub system_service_ready: bool,
+    pub player_state: PlayerState,
+    pub player_running: bool,
+    pub active_device_address: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for MediaBackendStatus {
+    fn default() -> Self {
+        Self {
+            backend: MediaBackendKind::Bluealsa,
+            installed: false,
+            system_service_ready: false,
+            player_state: PlayerState::Waiting,
+            player_running: false,
+            active_device_address: None,
+            last_error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub address: String,
@@ -22,10 +64,7 @@ pub struct DeviceInfo {
 pub struct AudioDefaults {
     pub output_device: Option<String>,
     pub input_device: Option<String>,
-    pub bluetooth_audio_supported: bool,
-    pub call_roles_detected: bool,
-    pub active_bluetooth_profile: Option<BluetoothProfile>,
-    pub a2dp_pinned: bool,
+    pub local_output_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,4 +80,5 @@ pub struct RuntimeStatus {
     pub active_device: Option<String>,
     pub devices: Vec<DeviceInfo>,
     pub audio: AudioDefaults,
+    pub backend: MediaBackendStatus,
 }

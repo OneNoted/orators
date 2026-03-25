@@ -9,6 +9,7 @@ pub struct OratorsConfig {
     pub pairing_timeout_secs: u64,
     pub auto_reconnect: bool,
     pub single_active_device: bool,
+    pub adapter: Option<String>,
     pub allowed_devices: Vec<String>,
 }
 
@@ -18,6 +19,7 @@ impl Default for OratorsConfig {
             pairing_timeout_secs: 120,
             auto_reconnect: true,
             single_active_device: true,
+            adapter: None,
             allowed_devices: Vec::new(),
         }
     }
@@ -29,6 +31,7 @@ struct RawOratorsConfig {
     pairing_timeout_secs: u64,
     auto_reconnect: bool,
     single_active_device: bool,
+    adapter: Option<String>,
     allowed_devices: Vec<String>,
     bluetooth_mode: Option<String>,
     call_audio_enabled: Option<bool>,
@@ -42,6 +45,7 @@ impl Default for RawOratorsConfig {
             pairing_timeout_secs: defaults.pairing_timeout_secs,
             auto_reconnect: defaults.auto_reconnect,
             single_active_device: defaults.single_active_device,
+            adapter: defaults.adapter,
             allowed_devices: defaults.allowed_devices,
             bluetooth_mode: None,
             call_audio_enabled: None,
@@ -64,6 +68,7 @@ impl<'de> Deserialize<'de> for OratorsConfig {
             pairing_timeout_secs: raw.pairing_timeout_secs,
             auto_reconnect: raw.auto_reconnect,
             single_active_device: raw.single_active_device,
+            adapter: normalize_adapter(raw.adapter),
             allowed_devices: normalize_allowed_devices(raw.allowed_devices),
         })
     }
@@ -137,6 +142,12 @@ fn normalize_allowed_devices(devices: Vec<String>) -> Vec<String> {
     normalized
 }
 
+fn normalize_adapter(adapter: Option<String>) -> Option<String> {
+    adapter
+        .map(|adapter| adapter.trim().to_ascii_lowercase())
+        .filter(|adapter| !adapter.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::OratorsConfig;
@@ -148,11 +159,13 @@ mod tests {
 pairing_timeout_secs = 45
 auto_reconnect = true
 single_active_device = true
+adapter = "HCI1"
 "#,
         )
         .unwrap();
 
         assert_eq!(parsed.pairing_timeout_secs, 45);
+        assert_eq!(parsed.adapter.as_deref(), Some("hci1"));
     }
 
     #[test]
@@ -187,9 +200,14 @@ allowed_devices = ["5c-dc-49-92-d0-d8", "5C:DC:49:92:D0:D8"]
 
     #[test]
     fn save_writes_only_media_safe_fields() {
-        let serialized = toml::to_string_pretty(&OratorsConfig::default()).unwrap();
+        let serialized = toml::to_string_pretty(&OratorsConfig {
+            adapter: Some("hci1".to_string()),
+            ..OratorsConfig::default()
+        })
+        .unwrap();
 
         assert!(serialized.contains("pairing_timeout_secs = 120"));
+        assert!(serialized.contains("adapter ="));
         assert!(serialized.contains("allowed_devices = []"));
         assert!(!serialized.contains("call_audio_enabled"));
         assert!(!serialized.contains("bluetooth_mode"));

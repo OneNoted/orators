@@ -1,31 +1,47 @@
 pub mod audio;
+pub mod bluealsa;
 pub mod bluez;
 pub mod diagnostics;
 pub mod systemd;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use orators_core::{AudioDefaults, DeviceInfo, DiagnosticsReport, OratorsConfig};
+use anyhow::{Context, Result};
+use orators_core::{
+    AudioDefaults, DeviceInfo, DiagnosticsReport, MediaBackendStatus, OratorsConfig,
+};
 
 use crate::{
-    audio::WpctlAudioRuntime, bluez::BluetoothCtlBluez, diagnostics::collect_report,
-    systemd::SystemdUserRuntime,
+    audio::LocalAudioRuntime,
+    bluealsa::{BluealsaAssets, BluealsaRuntime, SYSTEM_BACKEND_UNIT},
+    bluez::{BluetoothCtlBluez, remote_device_supports_media},
+    diagnostics::collect_report,
+    systemd::{ServiceStatus, SystemBackendInstallResult, SystemdUserRuntime},
 };
 
 pub struct LinuxPlatform {
     bluez: BluetoothCtlBluez,
-    audio: WpctlAudioRuntime,
+    audio: LocalAudioRuntime,
+    bluealsa: BluealsaRuntime,
     systemd: SystemdUserRuntime,
     config: OratorsConfig,
 }
 
 impl LinuxPlatform {
     pub async fn new(config: OratorsConfig) -> Result<Self> {
+        let systemd = SystemdUserRuntime;
+        if let Err(error) = systemd.cleanup_legacy_wireplumber_dropin().await {
+            tracing::warn!(?error, "failed to clean up legacy WirePlumber drop-in");
+        }
+        if let Err(error) = systemd.remove_legacy_fragment().await {
+            tracing::warn!(?error, "failed to clean up legacy WirePlumber fragment");
+        }
+
         Ok(Self {
-            bluez: BluetoothCtlBluez::new().await?,
-            audio: WpctlAudioRuntime,
-            systemd: SystemdUserRuntime,
+            bluez: BluetoothCtlBluez::new(config.adapter.clone()).await?,
+            audio: LocalAudioRuntime,
+            bluealsa: BluealsaRuntime::new(),
+            systemd,
             config,
         })
     }
@@ -35,7 +51,7 @@ impl LinuxPlatform {
     }
 
     pub async fn start_pairing(&self, timeout_secs: u64) -> Result<()> {
-        self.ensure_host_media_ready().await?;
+        self.ensure_backend_ready().await?;
         self.bluez.start_pairing(timeout_secs).await
     }
 
@@ -56,87 +72,200 @@ impl LinuxPlatform {
     }
 
     pub async fn connect_device(&self, address: &str) -> Result<()> {
-        self.ensure_host_media_ready().await?;
-        self.bluez.connect_device(address).await
+        self.ensure_backend_ready().await?;
+        self.ensure_audio_capable_device(address).await?;
+        self.bluez
+            .connect_device(address)
+            .await
+            .with_context(|| format!("failed to initiate Bluetooth connection for {address}"))?;
+
+        self.bluez
+            .wait_for_connected(address, std::time::Duration::from_secs(10))
+            .await?
+            .then_some(())
+            .context("the phone did not reach a connected Bluetooth state within 10 seconds")
     }
 
     pub async fn disconnect_device(&self, address: &str) -> Result<()> {
-        self.bluez.disconnect_device(address).await
+        self.bluez.disconnect_device(address).await?;
+        self.reconcile_runtime().await
     }
 
     pub async fn current_audio_defaults(&self) -> Result<AudioDefaults> {
-        let adapter = self.bluez.adapter_info().await.ok();
-        let active_device = self
-            .bluez
-            .list_devices(self.config.auto_reconnect)
-            .await
-            .ok()
-            .and_then(|devices| devices.into_iter().find(|device| device.connected))
-            .map(|device| device.address);
+        self.audio.current_defaults().await
+    }
 
-        let defaults = self
-            .audio
-            .current_defaults(
-                adapter.as_ref().is_some_and(adapter_supports_media),
-                adapter.as_ref().is_some_and(adapter_exposes_call_roles),
-                active_device.as_deref(),
-            )
-            .await?;
-        Ok(defaults)
+    pub async fn backend_status(&self) -> Result<MediaBackendStatus> {
+        let installed = self.systemd.wireplumber_fragment_installed()?;
+        let service_status = self.system_backend_status().await?;
+        let service_ready = service_status
+            .as_ref()
+            .is_some_and(|status| status.active_state == "active" && status.sub_state == "running");
+        Ok(self.bluealsa.backend_status(installed, service_ready).await)
     }
 
     pub async fn ensure_host_media_ready(&self) -> Result<()> {
-        let adapter = self.bluez.adapter_info().await?;
-        if !adapter_supports_media(&adapter) {
-            anyhow::bail!(
-                "the stock Bluetooth stack does not advertise Audio Sink / A2DP media support"
-            );
-        }
-
-        let wireplumber = self.systemd.service_status("wireplumber.service").await?;
-        if wireplumber.active_state != "active" || wireplumber.sub_state != "running" {
-            anyhow::bail!(
-                "wireplumber.service is not healthy: ActiveState={}, SubState={}",
-                wireplumber.active_state,
-                wireplumber.sub_state
-            );
-        }
-
-        let defaults = self.audio.pipewire_defaults().await?;
-        if defaults.output_device.is_none() || defaults.output_is_dummy {
-            anyhow::bail!("PipeWire does not currently have a usable default sink");
-        }
-
-        self.audio.apply_media_stability_settings().await?;
-
-        Ok(())
+        self.ensure_backend_ready().await
     }
 
-    pub async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()> {
-        if active_device.is_some() {
-            let wireplumber = self.systemd.service_status("wireplumber.service").await?;
-            if wireplumber.active_state != "active" || wireplumber.sub_state != "running" {
-                anyhow::bail!(
-                    "wireplumber.service became unhealthy while Bluetooth audio was active"
-                );
-            }
-            let defaults = self.audio.pipewire_defaults().await?;
-            if defaults.output_device.is_none() || defaults.output_is_dummy {
-                anyhow::bail!(
-                    "PipeWire default sink is unavailable while Bluetooth audio is active"
-                );
-            }
+    pub async fn guard_active_audio(&self, _active_device: Option<&str>) -> Result<()> {
+        self.reconcile_runtime().await
+    }
+
+    pub async fn reconcile_runtime(&self) -> Result<()> {
+        let installed = self.systemd.wireplumber_fragment_installed()?;
+        let Some(service_status) = self.system_backend_status().await? else {
+            self.bluealsa.stop_player().await?;
+            return Ok(());
+        };
+
+        if service_status.active_state != "active" || service_status.sub_state != "running" {
+            self.bluealsa.stop_player().await?;
+            return Ok(());
         }
 
-        Ok(())
+        if !installed {
+            self.bluealsa.stop_player().await?;
+            return Ok(());
+        }
+
+        let active_device = self
+            .bluez
+            .remote_devices()
+            .await?
+            .into_iter()
+            .find(|device| device.connected && remote_device_supports_media(device))
+            .map(|device| device.address);
+
+        let assets = BluealsaAssets::discover()?;
+        self.bluealsa
+            .reconcile_player(&assets, active_device.as_deref())
+            .await
     }
 
     pub async fn diagnostics(&self) -> Result<DiagnosticsReport> {
-        collect_report(&self.bluez, &self.audio, &self.systemd).await
+        collect_report(
+            &self.bluez,
+            &self.audio,
+            &self.systemd,
+            self.config.adapter.as_deref(),
+            self.system_backend_status().await?,
+        )
+        .await
     }
 
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {
         self.systemd.install_user_service(daemon_path).await
+    }
+
+    pub async fn install_system_backend(
+        &self,
+        adapter: Option<&str>,
+    ) -> Result<SystemBackendInstallResult> {
+        if self.any_connected_audio_devices().await? {
+            anyhow::bail!(
+                "disconnect connected Bluetooth audio devices before installing the Orators system backend"
+            );
+        }
+
+        let assets = BluealsaAssets::discover()?;
+        let adapter = self.resolve_adapter(adapter).await?;
+        self.systemd.install_system_backend(&assets, &adapter).await
+    }
+
+    pub async fn uninstall_system_backend(&self) -> Result<()> {
+        if self.any_connected_audio_devices().await? {
+            anyhow::bail!(
+                "disconnect connected Bluetooth audio devices before uninstalling the Orators system backend"
+            );
+        }
+
+        self.systemd.uninstall_system_backend().await
+    }
+
+    async fn ensure_backend_ready(&self) -> Result<()> {
+        self.bluez
+            .adapter_info()
+            .await
+            .context("no BlueZ adapter is available for pairing")?;
+
+        if !self.systemd.wireplumber_fragment_installed()? {
+            anyhow::bail!("the managed WirePlumber Bluetooth-disable fragment is not installed");
+        }
+
+        BluealsaAssets::discover().context("BlueALSA binaries are not available")?;
+
+        let backend_status = self
+            .system_backend_status()
+            .await?
+            .context("the Orators BlueALSA system service is not installed")?;
+        if backend_status.active_state != "active" || backend_status.sub_state != "running" {
+            anyhow::bail!(
+                "the Orators BlueALSA system service is not healthy: ActiveState={}, SubState={}",
+                backend_status.active_state,
+                backend_status.sub_state
+            );
+        }
+
+        let defaults = self.audio.current_defaults().await?;
+        if !defaults.local_output_available {
+            anyhow::bail!("the host does not currently expose a usable local playback output");
+        }
+
+        Ok(())
+    }
+
+    async fn system_backend_status(&self) -> Result<Option<ServiceStatus>> {
+        match self
+            .systemd
+            .system_service_status(SYSTEM_BACKEND_UNIT)
+            .await
+        {
+            Ok(status) => Ok(Some(status)),
+            Err(error) if error.to_string().contains("could not be found") => Ok(None),
+            Err(error) if error.to_string().contains("not-found") => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn ensure_audio_capable_device(&self, address: &str) -> Result<()> {
+        let device = self
+            .bluez
+            .remote_devices()
+            .await?
+            .into_iter()
+            .find(|device| device.address == address)
+            .with_context(|| format!("no BlueZ device found for {address}"))?;
+
+        if remote_device_supports_media(&device) {
+            Ok(())
+        } else {
+            anyhow::bail!("{address} does not advertise a classic A2DP audio-source profile");
+        }
+    }
+
+    async fn any_connected_audio_devices(&self) -> Result<bool> {
+        Ok(self
+            .bluez
+            .all_remote_devices()
+            .await?
+            .into_iter()
+            .any(|device| device.connected && remote_device_supports_media(&device)))
+    }
+
+    async fn resolve_adapter(&self, requested: Option<&str>) -> Result<String> {
+        if let Some(adapter) = requested.or(self.config.adapter.as_deref()) {
+            return Ok(adapter.to_ascii_lowercase());
+        }
+
+        let powered = self.bluez.powered_adapter_ids().await?;
+        match powered.as_slice() {
+            [adapter] => Ok(adapter.clone()),
+            [] => anyhow::bail!("no powered BlueZ adapter is available"),
+            _ => anyhow::bail!(
+                "multiple powered Bluetooth adapters were found; rerun install with --adapter hciX"
+            ),
+        }
     }
 }
 
@@ -145,23 +274,4 @@ pub fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn adapter_supports_media(adapter: &crate::bluez::AdapterInfo) -> bool {
-    adapter.uuids.iter().any(|uuid| {
-        uuid.eq_ignore_ascii_case("0000110b-0000-1000-8000-00805f9b34fb")
-            || uuid.eq_ignore_ascii_case("0000110d-0000-1000-8000-00805f9b34fb")
-    })
-}
-
-fn adapter_exposes_call_roles(adapter: &crate::bluez::AdapterInfo) -> bool {
-    adapter.uuids.iter().any(|uuid| {
-        matches!(
-            uuid.to_ascii_lowercase().as_str(),
-            "00001108-0000-1000-8000-00805f9b34fb"
-                | "00001112-0000-1000-8000-00805f9b34fb"
-                | "0000111e-0000-1000-8000-00805f9b34fb"
-                | "0000111f-0000-1000-8000-00805f9b34fb"
-        )
-    })
 }

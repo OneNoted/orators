@@ -3,7 +3,7 @@ use std::{path::Path, path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use orators_core::{
-    AudioDefaults, BluetoothProfile, DeviceInfo, DiagnosticsReport, OratorsConfig, OratorsState,
+    AudioDefaults, DeviceInfo, DiagnosticsReport, MediaBackendStatus, OratorsConfig, OratorsState,
 };
 use tokio::sync::Mutex;
 
@@ -18,8 +18,10 @@ pub trait PlatformRuntime: Send + Sync {
     async fn connect_device(&self, address: &str) -> Result<()>;
     async fn disconnect_device(&self, address: &str) -> Result<()>;
     async fn current_audio_defaults(&self) -> Result<AudioDefaults>;
+    async fn backend_status(&self) -> Result<MediaBackendStatus>;
     async fn ensure_host_media_ready(&self) -> Result<()>;
     async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()>;
+    async fn reconcile_runtime(&self) -> Result<()>;
     async fn diagnostics(&self) -> Result<DiagnosticsReport>;
     async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf>;
 }
@@ -62,12 +64,20 @@ impl PlatformRuntime for orators_linux::LinuxPlatform {
         self.current_audio_defaults().await
     }
 
+    async fn backend_status(&self) -> Result<MediaBackendStatus> {
+        self.backend_status().await
+    }
+
     async fn ensure_host_media_ready(&self) -> Result<()> {
         self.ensure_host_media_ready().await
     }
 
     async fn guard_active_audio(&self, active_device: Option<&str>) -> Result<()> {
         self.guard_active_audio(active_device).await
+    }
+
+    async fn reconcile_runtime(&self) -> Result<()> {
+        self.reconcile_runtime().await
     }
 
     async fn diagnostics(&self) -> Result<DiagnosticsReport> {
@@ -118,7 +128,6 @@ impl<R: PlatformRuntime> OratorsService<R> {
 
     pub async fn start_pairing(&self, timeout_secs: Option<u64>) -> Result<String> {
         let timeout_secs = timeout_secs.unwrap_or_else(|| self.default_timeout());
-        self.runtime.ensure_host_media_ready().await?;
         self.runtime.start_pairing(timeout_secs).await?;
 
         let now = now_epoch_secs();
@@ -185,14 +194,15 @@ impl<R: PlatformRuntime> OratorsService<R> {
     }
 
     pub async fn connect_device(&self, address: &str) -> Result<String> {
-        self.runtime.ensure_host_media_ready().await?;
         self.refresh_status().await?;
+        {
+            let state = self.state.lock().await;
+            state.can_connect_device(address)?;
+        }
+        self.runtime.ensure_host_media_ready().await?;
         self.runtime.connect_device(address).await?;
-
-        let now = now_epoch_secs();
-        let mut state = self.state.lock().await;
-        state.connect_device(address, BluetoothProfile::Media)?;
-        serialize(&state.status(now))
+        let status = self.refresh_status().await?;
+        serialize(&status)
     }
 
     pub async fn disconnect_active(&self) -> Result<String> {
@@ -203,7 +213,8 @@ impl<R: PlatformRuntime> OratorsService<R> {
             state.disconnect_active();
         }
 
-        self.status_json().await
+        let status = self.refresh_status().await?;
+        serialize(&status)
     }
 
     pub async fn diagnostics_json(&self) -> Result<String> {
@@ -217,6 +228,7 @@ impl<R: PlatformRuntime> OratorsService<R> {
     }
 
     pub async fn protect_active_audio_if_needed(&self) -> Result<Option<String>> {
+        self.runtime.reconcile_runtime().await?;
         let active_device = {
             self.state
                 .lock()
@@ -250,14 +262,31 @@ impl<R: PlatformRuntime> OratorsService<R> {
         Ok(None)
     }
 
+    pub async fn background_tick(&self) -> Result<Option<String>> {
+        let expired_status = self.expire_pairing_if_needed().await?;
+        self.runtime.reconcile_runtime().await?;
+
+        if expired_status.is_some() {
+            return Ok(expired_status);
+        }
+
+        let status = self.refresh_status().await?;
+        serialize(&status).map(Some)
+    }
+
     async fn refresh_status(&self) -> Result<orators_core::RuntimeStatus> {
         let devices = self.runtime.list_devices().await?;
         let devices = self.apply_allowlist_if_needed(devices).await?;
+        if let Err(error) = self.runtime.reconcile_runtime().await {
+            tracing::warn!(?error, "failed to reconcile BlueALSA playback runtime");
+        }
         let audio = self.runtime.current_audio_defaults().await?;
+        let backend = self.runtime.backend_status().await?;
         let now = now_epoch_secs();
         let mut state = self.state.lock().await;
         state.sync_devices(devices);
         state.update_audio(audio);
+        state.update_backend(backend);
         Ok(state.status(now))
     }
 
@@ -308,12 +337,14 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use orators_core::{
-        AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, OratorsConfig, Severity,
+        AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, MediaBackendStatus,
+        OratorsConfig, Severity,
     };
 
     struct MockRuntime {
         devices: tokio::sync::Mutex<Vec<DeviceInfo>>,
         disconnects: tokio::sync::Mutex<Vec<String>>,
+        connects: tokio::sync::Mutex<Vec<String>>,
         stop_pairing_calls: tokio::sync::Mutex<usize>,
     }
 
@@ -322,6 +353,7 @@ mod tests {
             Self {
                 devices: tokio::sync::Mutex::new(devices),
                 disconnects: tokio::sync::Mutex::new(Vec::new()),
+                connects: tokio::sync::Mutex::new(Vec::new()),
                 stop_pairing_calls: tokio::sync::Mutex::new(0),
             }
         }
@@ -377,6 +409,7 @@ mod tests {
         }
 
         async fn connect_device(&self, address: &str) -> Result<()> {
+            self.connects.lock().await.push(address.to_string());
             if let Some(device) = self
                 .devices
                 .lock()
@@ -398,10 +431,23 @@ mod tests {
             Ok(AudioDefaults {
                 output_device: Some("Speakers".to_string()),
                 input_device: Some("Microphone".to_string()),
-                bluetooth_audio_supported: true,
-                call_roles_detected: false,
-                active_bluetooth_profile: None,
-                a2dp_pinned: true,
+                local_output_available: true,
+            })
+        }
+
+        async fn backend_status(&self) -> Result<MediaBackendStatus> {
+            let active = self
+                .devices
+                .lock()
+                .await
+                .iter()
+                .find(|device| device.connected)
+                .map(|device| device.address.clone());
+            Ok(MediaBackendStatus {
+                installed: true,
+                system_service_ready: true,
+                active_device_address: active,
+                ..MediaBackendStatus::default()
             })
         }
 
@@ -410,6 +456,10 @@ mod tests {
         }
 
         async fn guard_active_audio(&self, _active_device: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reconcile_runtime(&self) -> Result<()> {
             Ok(())
         }
 
@@ -496,5 +546,18 @@ mod tests {
 
         assert!(status.devices[0].trusted);
         assert!(status.devices[0].auto_reconnect);
+    }
+
+    #[tokio::test]
+    async fn second_connect_is_rejected_before_runtime_call() {
+        let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA"), sample_device("BB")]));
+        let service = OratorsService::new(runtime.clone(), OratorsConfig::default());
+
+        service.connect_device("AA").await.unwrap();
+        let error = service.connect_device("BB").await.unwrap_err();
+
+        assert!(error.to_string().contains("already active"));
+        let connects = runtime.connects.lock().await.clone();
+        assert_eq!(connects, vec!["AA".to_string()]);
     }
 }

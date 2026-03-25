@@ -3,9 +3,10 @@ use std::{env, path::PathBuf};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use orators_core::{
-    BluetoothProfile, DiagnosticCheck, DiagnosticsReport, OratorsConfig, RuntimeStatus, Severity,
-    dbus, normalize_device_address,
+    BluetoothProfile, DiagnosticCheck, DiagnosticsReport, OratorsConfig, PlayerState,
+    RuntimeStatus, Severity, dbus, normalize_device_address,
 };
+use orators_linux::LinuxPlatform;
 use orators_linux::systemd::SystemdUserRuntime;
 use serde_json::Value;
 use zbus::{Connection, Proxy, fdo::DBusProxy, names::BusName};
@@ -27,9 +28,16 @@ pub enum Command {
     Status,
     Pair(PairArgs),
     Devices(DeviceArgs),
-    Connect { mac: String },
+    Connect {
+        mac: String,
+    },
     Disconnect,
     Doctor,
+    InstallSystemBackend {
+        #[arg(long)]
+        adapter: Option<String>,
+    },
+    UninstallSystemBackend,
     InstallUserService,
 }
 
@@ -57,15 +65,32 @@ pub struct DeviceArgs {
 #[derive(Debug, Subcommand)]
 pub enum DeviceCommand {
     List,
-    Allow { mac: String },
-    Disallow { mac: String },
-    Trust { mac: String },
-    Forget { mac: String },
+    Allow {
+        mac: String,
+    },
+    Disallow {
+        mac: String,
+    },
+    Trust {
+        mac: String,
+    },
+    Forget {
+        mac: String,
+    },
+    Reset {
+        mac: String,
+        #[arg(long)]
+        drop_allowlist: bool,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::InstallUserService => install_user_service(cli.json).await,
+        Command::InstallSystemBackend { adapter } => {
+            install_system_backend(cli.json, adapter).await
+        }
+        Command::UninstallSystemBackend => uninstall_system_backend(cli.json).await,
         Command::Doctor => run_doctor(cli.json).await,
         command => run_daemon_command(command, cli.json).await,
     }
@@ -137,6 +162,36 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
                 let output = client.forget_device(&mac).await?;
                 render_status_output(output, json, "Device removed.")?;
             }
+            DeviceCommand::Reset {
+                mac,
+                drop_allowlist,
+            } => {
+                let mac = normalize_device_address(&mac);
+                if drop_allowlist {
+                    update_allowlist(&mac, false)?;
+                }
+                let status = client.status().await?;
+                let status: RuntimeStatus = serde_json::from_str(&status)?;
+                if status.active_device.as_deref() == Some(mac.as_str()) {
+                    let _ = client.disconnect_active().await;
+                }
+                let output = client.forget_device(&mac).await?;
+                if json {
+                    print_jsonish(&output)?;
+                } else {
+                    let status: RuntimeStatus = serde_json::from_str(&output)?;
+                    println!("Device reset on the host.");
+                    if drop_allowlist {
+                        println!("Allowlist entry removed.");
+                    } else {
+                        println!("Allowlist entry preserved.");
+                    }
+                    println!(
+                        "Next: If you also removed it on the phone, run `oratorsctl pair start --timeout 120` and pair again."
+                    );
+                    render_status(&status, None);
+                }
+            }
         },
         Command::Connect { mac } => {
             let output = client.connect_device(&mac).await?;
@@ -146,7 +201,10 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
             let output = client.disconnect_active().await?;
             render_status_output(output, json, "Disconnect request sent.")?;
         }
-        Command::Doctor | Command::InstallUserService => unreachable!(),
+        Command::Doctor
+        | Command::InstallUserService
+        | Command::InstallSystemBackend { .. }
+        | Command::UninstallSystemBackend => unreachable!(),
     }
     Ok(())
 }
@@ -176,6 +234,68 @@ async fn install_user_service(json: bool) -> Result<()> {
         println!("Installed user service at {}.", unit_path.display());
         println!("This only installs the daemon unit.");
     }
+    Ok(())
+}
+
+async fn install_system_backend(json: bool, adapter: Option<String>) -> Result<()> {
+    let config_path = default_config_path()?;
+    let mut config = ensure_config_exists(&config_path)?;
+    let mut effective_config = config.clone();
+    if let Some(adapter) = adapter.clone() {
+        effective_config.adapter = Some(adapter.to_ascii_lowercase());
+    }
+
+    let daemon_path = resolve_daemon_path()?;
+    let runtime = LinuxPlatform::new(effective_config).await?;
+    let user_unit_path = runtime.install_user_service(&daemon_path).await?;
+    let install = runtime.install_system_backend(adapter.as_deref()).await?;
+
+    config.adapter = Some(install.adapter.clone());
+    config.save(&config_path)?;
+
+    if json {
+        let payload = serde_json::json!({
+            "user_service_path": user_unit_path,
+            "wireplumber_fragment_path": install.wireplumber_fragment_path,
+            "dbus_policy_path": install.dbus_policy_path,
+            "system_unit_path": install.system_unit_path,
+            "adapter": install.adapter,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("Installed user service at {}.", user_unit_path.display());
+        println!(
+            "Installed WirePlumber Bluetooth-disable fragment at {}.",
+            install.wireplumber_fragment_path.display()
+        );
+        println!(
+            "Installed BlueALSA D-Bus policy at {}.",
+            install.dbus_policy_path.display()
+        );
+        println!(
+            "Installed BlueALSA system backend at {}.",
+            install.system_unit_path.display()
+        );
+        println!("Selected Bluetooth adapter: {}.", install.adapter);
+        println!("Restart WirePlumber and the Orators daemon to activate the backend.");
+    }
+
+    Ok(())
+}
+
+async fn uninstall_system_backend(json: bool) -> Result<()> {
+    let config_path = default_config_path()?;
+    let config = ensure_config_exists(&config_path)?;
+    let runtime = LinuxPlatform::new(config).await?;
+    runtime.uninstall_system_backend().await?;
+
+    if json {
+        println!("{{\"removed\":true}}");
+    } else {
+        println!("Removed the Orators system backend.");
+        println!("WirePlumber Bluetooth ownership was restored.");
+    }
+
     Ok(())
 }
 
@@ -316,23 +436,31 @@ fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&Diagnostics
             .unwrap_or("not detected")
     );
     println!(
-        "Bluetooth speaker support: {}",
-        yes_no(status.audio.bluetooth_audio_supported),
+        "Local playback output: {}",
+        yes_no(status.audio.local_output_available)
     );
     println!(
-        "Extra call roles on host: {}",
-        yes_no(status.audio.call_roles_detected),
+        "Backend: {}",
+        match status.backend.backend {
+            orators_core::MediaBackendKind::Bluealsa => "bluealsa",
+        }
+    );
+    println!("Backend installed: {}", yes_no(status.backend.installed),);
+    println!(
+        "Backend service ready: {}",
+        yes_no(status.backend.system_service_ready),
     );
     println!(
-        "Active Bluetooth profile: {}",
-        status
-            .audio
-            .active_bluetooth_profile
-            .as_ref()
-            .map(profile_label)
-            .unwrap_or("none"),
+        "Player state: {}",
+        player_state_label(&status.backend.player_state),
     );
-    println!("A2DP pinned: {}", yes_no(status.audio.a2dp_pinned));
+    println!("Player running: {}", yes_no(status.backend.player_running));
+    if let Some(address) = status.backend.active_device_address.as_deref() {
+        println!("Backend active device: {address}");
+    }
+    if let Some(error) = status.backend.last_error.as_deref() {
+        println!("Last backend error: {error}");
+    }
     if let Some(summary) = diagnostics.and_then(host_support_summary) {
         println!("Host readiness: {summary}");
     }
@@ -404,6 +532,15 @@ fn profile_label(profile: &BluetoothProfile) -> &'static str {
     match profile {
         BluetoothProfile::Media => "media",
         BluetoothProfile::Call => "call",
+    }
+}
+
+fn player_state_label(state: &PlayerState) -> &'static str {
+    match state {
+        PlayerState::Waiting => "waiting",
+        PlayerState::Starting => "starting",
+        PlayerState::Playing => "playing",
+        PlayerState::Error => "error",
     }
 }
 
@@ -548,10 +685,15 @@ fn explain_dbus_error(action: &str, error: zbus::Error) -> anyhow::Error {
     let detail = error.to_string();
     let next_step = if detail.contains("pairing window is closed") {
         "Run `oratorsctl pair start --timeout 120` before pairing a new device."
-    } else if detail.contains("does not advertise Audio Sink / A2DP media support") {
-        "Run `oratorsctl doctor` and fix the host Bluetooth audio stack outside Orators."
-    } else if detail.contains("usable default sink") || detail.contains("wireplumber.service") {
-        "Run `oratorsctl doctor` and repair the host audio session before retrying."
+    } else if detail.contains("BlueALSA")
+        || detail.contains("bluealsad")
+        || detail.contains("WirePlumber Bluetooth-disable fragment")
+    {
+        "Run `oratorsctl doctor`, then install or repair the managed backend with `oratorsctl install-system-backend`."
+    } else if detail.contains("ALSA does not currently expose") || detail.contains("`aplay`") {
+        "Run `oratorsctl doctor` and repair the host ALSA/PipeWire playback output before retrying."
+    } else if detail.contains("classic A2DP audio-source profile") {
+        "This device does not advertise classic Bluetooth media-source support, so it is not a supported speaker source."
     } else if detail.contains("RequestDefaultAgent") {
         "Close other Bluetooth pairing dialogs, then rerun `oratorsctl pair start`."
     } else if detail.contains("no BlueZ adapter found") {
