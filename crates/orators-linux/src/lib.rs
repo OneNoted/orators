@@ -107,6 +107,8 @@ impl LinuxPlatform {
             anyhow::bail!("PipeWire does not currently have a usable default sink");
         }
 
+        self.audio.apply_media_stability_settings().await?;
+
         Ok(())
     }
 

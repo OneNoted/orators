@@ -59,6 +59,10 @@ pub async fn collect_report(
 
     let runtime_settings = audio.bluetooth_runtime_settings().await.ok();
     checks.push(headset_autoswitch_check(runtime_settings.as_ref()));
+    checks.push(device_restore_profile_check(runtime_settings.as_ref()));
+    checks.push(bluetooth_persistent_storage_check(
+        runtime_settings.as_ref(),
+    ));
 
     let bluetooth_cards = audio.bluetooth_cards().await.ok();
     let active_device = bluez
@@ -238,7 +242,7 @@ fn headset_autoswitch_check(settings: Option<&BluetoothRuntimeSettings>) -> Diag
                     .to_string(),
             ),
             remediation: Some(
-                "Orators will disable this setting at runtime before pairing or connecting devices."
+                "If this host starts switching profiles on its own, disable the setting in WirePlumber outside Orators."
                     .to_string(),
             ),
         },
@@ -248,6 +252,89 @@ fn headset_autoswitch_check(settings: Option<&BluetoothRuntimeSettings>) -> Diag
             summary: "Bluetooth headset autoswitch state could not be inspected".to_string(),
             detail: Some(
                 "wpctl could not read the `bluetooth.autoswitch-to-headset-profile` runtime setting."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "Make sure WirePlumber is healthy before using Orators with Bluetooth audio."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn device_restore_profile_check(settings: Option<&BluetoothRuntimeSettings>) -> DiagnosticCheck {
+    match settings.and_then(|settings| settings.device_restore_profile) {
+        Some(false) => DiagnosticCheck {
+            code: "wireplumber.device_restore_profile".to_string(),
+            severity: Severity::Info,
+            summary: "Bluetooth profile restore is disabled at runtime".to_string(),
+            detail: Some(
+                "WirePlumber will not restore a previous headset profile for Bluetooth devices, which keeps the Fold7 on the stable media profile instead of drifting back to audio-gateway."
+                    .to_string(),
+            ),
+            remediation: None,
+        },
+        Some(true) => DiagnosticCheck {
+            code: "wireplumber.device_restore_profile".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth profile restore is enabled at runtime".to_string(),
+            detail: Some(
+                "WirePlumber may restore a previously selected headset profile on reconnect, which can drag media-only devices back into the wrong Bluetooth mode."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "If Bluetooth devices keep reconnecting in the wrong profile, disable profile restore at runtime."
+                    .to_string(),
+            ),
+        },
+        None => DiagnosticCheck {
+            code: "wireplumber.device_restore_profile".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth profile restore state could not be inspected".to_string(),
+            detail: Some(
+                "wpctl could not read the `device.restore-profile` runtime setting.".to_string(),
+            ),
+            remediation: Some(
+                "Make sure WirePlumber is healthy before using Orators with Bluetooth audio."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn bluetooth_persistent_storage_check(
+    settings: Option<&BluetoothRuntimeSettings>,
+) -> DiagnosticCheck {
+    match settings.and_then(|settings| settings.bluetooth_persistent_storage) {
+        Some(false) => DiagnosticCheck {
+            code: "wireplumber.bluetooth_persistent_storage".to_string(),
+            severity: Severity::Info,
+            summary: "Bluetooth persistent storage is disabled at runtime".to_string(),
+            detail: Some(
+                "WirePlumber will not reuse saved Bluetooth state for reconnects, which avoids replaying stale headset selections on this host."
+                    .to_string(),
+            ),
+            remediation: None,
+        },
+        Some(true) => DiagnosticCheck {
+            code: "wireplumber.bluetooth_persistent_storage".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth persistent storage is enabled at runtime".to_string(),
+            detail: Some(
+                "Saved Bluetooth state can bring back a previously unstable profile choice when the device reconnects."
+                    .to_string(),
+            ),
+            remediation: Some(
+                "If the Bluetooth profile keeps drifting after reconnects, disable persistent storage at runtime."
+                    .to_string(),
+            ),
+        },
+        None => DiagnosticCheck {
+            code: "wireplumber.bluetooth_persistent_storage".to_string(),
+            severity: Severity::Warn,
+            summary: "Bluetooth persistent storage state could not be inspected".to_string(),
+            detail: Some(
+                "wpctl could not read the `bluetooth.use-persistent-storage` runtime setting."
                     .to_string(),
             ),
             remediation: Some(

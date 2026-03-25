@@ -36,13 +36,13 @@ nix flake check
 - `oratorsd` runs under `systemd --user`
 - `oratorsctl` talks to the daemon over the session bus
 - `oratorsctl install-user-service` installs the daemon unit
-- Orators does not write WirePlumber fragments, saved `wpctl` settings, or session-manager overrides
+- Orators does not write WirePlumber fragments or session-manager overrides. It does reapply runtime Bluetooth stability settings in the current session so Bluetooth devices stay on A2DP instead of drifting into headset mode.
 
 ## Host Model
 
 - The user session must have a healthy PipeWire setup with a real default sink
 - The stock BlueZ system service must be healthy
-- Orators leaves the desktop audio session manager alone and only reads host state
+- Orators leaves the desktop audio session manager alone and only reads host state, but it does clear WirePlumber runtime Bluetooth settings that can drag devices back into headset mode
 
 ## Configuration
 
@@ -61,7 +61,7 @@ Legacy Bluetooth-mode fields are still ignored on load so existing configs remai
 1. Run `oratorsctl install-user-service` once to install the daemon unit.
 2. Run `oratorsctl doctor` before pairing or connecting a phone.
 3. If doctor reports that the host audio stack is unsupported or unhealthy, fix the host outside Orators first.
-4. Orators will not write WirePlumber fragments, saved `wpctl` settings, or other PipeWire session policy files.
+4. Orators will not write WirePlumber fragments or other PipeWire session policy files, but it will keep the Bluetooth runtime settings pinned to the media-safe values for the current session.
 
 ## License
 
