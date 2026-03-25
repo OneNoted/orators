@@ -1,6 +1,7 @@
 use std::{
     env,
     ffi::OsStr,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
@@ -13,8 +14,14 @@ use tokio::{process::Child, process::Command, sync::Mutex};
 const PLAYER_RESTART_BACKOFF: Duration = Duration::from_secs(3);
 const PLAYER_MAX_RESTARTS: u8 = 3;
 pub const SYSTEM_BACKEND_UNIT: &str = "orators-bluealsad.service";
-const PACKAGED_BLUEALSA_DIRS: &[&str] =
-    &["/usr/libexec/orators/bluealsa", "/usr/lib/orators/bluealsa"];
+const TRUSTED_BLUEALSA_DIRS: &[&str] = &[
+    "/usr/libexec/orators/bluealsa",
+    "/usr/lib/orators/bluealsa",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BluealsaAssets {
@@ -26,25 +33,18 @@ pub struct BluealsaAssets {
 impl BluealsaAssets {
     pub fn discover() -> Result<Self> {
         if let Some(dir) = env::var_os("ORATORS_BLUEALSA_DIR") {
-            return Self::discover_in_dir(Path::new(&dir)).with_context(|| {
+            return Self::discover_in_trusted_dir(Path::new(&dir)).with_context(|| {
                 format!(
-                    "failed to discover BlueALSA assets in {}",
+                    "failed to discover trusted BlueALSA assets in {}",
                     Path::new(&dir).display()
                 )
             });
         }
 
-        match Self::discover_in_packaged_dirs(PACKAGED_BLUEALSA_DIRS.iter().map(Path::new)) {
-            Ok(assets) => Ok(assets),
-            Err(packaged_error) => {
-                let path = env::var_os("PATH").context("failed to find BlueALSA assets in PATH")?;
-                Self::discover_in_path(&path).map_err(|path_error| {
-                    anyhow::anyhow!("{packaged_error}; {path_error}")
-                })
-            }
-        }
+        Self::discover_in_trusted_dirs(TRUSTED_BLUEALSA_DIRS.iter().map(Path::new))
     }
 
+    #[cfg(test)]
     fn discover_in_path(path: &OsStr) -> Result<Self> {
         Ok(Self {
             bluealsad: find_binary_in_path("bluealsad", path)
@@ -72,17 +72,32 @@ impl BluealsaAssets {
         }
     }
 
-    fn discover_in_packaged_dirs<'a>(
+    fn discover_in_trusted_dir(dir: &Path) -> Result<Self> {
+        let assets = Self::discover_in_dir(dir)?;
+        if is_secure_system_binary(&assets.bluealsad)
+            && is_secure_system_binary(&assets.bluealsa_aplay)
+            && is_secure_system_binary(&assets.bluealsactl)
+        {
+            Ok(assets)
+        } else {
+            anyhow::bail!(
+                "one or more BlueALSA binaries in {} are not trusted system executables",
+                dir.display()
+            );
+        }
+    }
+
+    fn discover_in_trusted_dirs<'a>(
         dirs: impl IntoIterator<Item = &'a Path>,
     ) -> Result<Self> {
-        let mut packaged_error = None;
+        let mut discovery_error = None;
         for dir in dirs {
             if dir.exists() {
-                match Self::discover_in_dir(dir) {
+                match Self::discover_in_trusted_dir(dir) {
                     Ok(assets) => return Ok(assets),
                     Err(error) => {
-                        packaged_error = Some(anyhow::anyhow!(
-                            "failed to discover packaged BlueALSA assets in {}: {error}",
+                        discovery_error = Some(anyhow::anyhow!(
+                            "failed to discover trusted BlueALSA assets in {}: {error}",
                             dir.display()
                         ));
                     }
@@ -90,11 +105,32 @@ impl BluealsaAssets {
             }
         }
 
-        match packaged_error {
+        match discovery_error {
             Some(error) => Err(error),
-            None => Err(anyhow::anyhow!(
-                "no packaged BlueALSA asset directories were found"
-            )),
+            None => Err(anyhow::anyhow!("no trusted BlueALSA asset directories were found")),
+        }
+    }
+
+    #[cfg(test)]
+    fn discover_in_dirs<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Result<Self> {
+        let mut discovery_error = None;
+        for dir in dirs {
+            if dir.exists() {
+                match Self::discover_in_dir(dir) {
+                    Ok(assets) => return Ok(assets),
+                    Err(error) => {
+                        discovery_error = Some(anyhow::anyhow!(
+                            "failed to discover BlueALSA assets in {}: {error}",
+                            dir.display()
+                        ));
+                    }
+                }
+            }
+        }
+
+        match discovery_error {
+            Some(error) => Err(error),
+            None => Err(anyhow::anyhow!("no BlueALSA asset directories were found")),
         }
     }
 }
@@ -304,6 +340,7 @@ impl PlayerSupervisor {
     }
 }
 
+#[cfg(test)]
 fn find_binary_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
     env::split_paths(path)
         .map(|dir| dir.join(name))
@@ -311,23 +348,23 @@ fn find_binary_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-        path.is_file()
-            && path.file_name().is_some_and(|name| name != OsStr::new(""))
-            && std::fs::metadata(path)
-                .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-    }
+    path.is_file()
+        && path.file_name().is_some_and(|name| name != OsStr::new(""))
+        && std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
 
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-            && path.file_name().is_some_and(|name| name != OsStr::new(""))
-            && std::fs::metadata(path).is_ok()
-    }
+fn is_secure_system_binary(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.is_absolute()
+        && is_executable(path)
+        && std::fs::metadata(path)
+            .map(|metadata| metadata.uid() == 0 && metadata.permissions().mode() & 0o022 == 0)
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -394,7 +431,7 @@ mod tests {
             fs::set_permissions(&binary, permissions).unwrap();
         }
 
-        let assets = BluealsaAssets::discover_in_packaged_dirs([
+        let assets = BluealsaAssets::discover_in_dirs([
             invalid_dir.path(),
             valid_dir.path(),
         ])

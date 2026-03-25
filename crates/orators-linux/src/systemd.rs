@@ -1,7 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::{io::Write, path::{Path, PathBuf}};
 
 use anyhow::{Context, Result};
 use dirs::home_dir;
+use tempfile::NamedTempFile;
 use tokio::{fs, process::Command};
 
 use crate::bluealsa::{BluealsaAssets, SYSTEM_BACKEND_UNIT};
@@ -67,26 +68,28 @@ impl SystemdUserRuntime {
 
         let system_unit_path = system_backend_unit_path();
         let dbus_policy_path = system_backend_dbus_policy_path();
-        let temp_unit_path = std::env::temp_dir().join("orators-bluealsad.service");
-        let temp_policy_path = std::env::temp_dir().join(BACKEND_DBUS_POLICY_NAME);
-        fs::write(
-            &temp_unit_path,
-            render_system_backend_unit(&assets.bluealsad, adapter),
-        )
-        .await?;
-        fs::write(&temp_policy_path, render_system_backend_dbus_policy()).await?;
+        let mut temp_unit =
+            NamedTempFile::new().context("failed to create temporary systemd unit file")?;
+        let mut temp_policy =
+            NamedTempFile::new().context("failed to create temporary D-Bus policy file")?;
+        temp_unit
+            .write_all(render_system_backend_unit(&assets.bluealsad, adapter).as_bytes())
+            .context("failed to write temporary systemd unit file")?;
+        temp_policy
+            .write_all(render_system_backend_dbus_policy().as_bytes())
+            .context("failed to write temporary D-Bus policy file")?;
         let install_result = async {
             self.run_sudo([
                 "install",
                 "-Dm644",
-                temp_unit_path.to_string_lossy().as_ref(),
+                temp_unit.path().to_string_lossy().as_ref(),
                 system_unit_path.to_string_lossy().as_ref(),
             ])
             .await?;
             self.run_sudo([
                 "install",
                 "-Dm644",
-                temp_policy_path.to_string_lossy().as_ref(),
+                temp_policy.path().to_string_lossy().as_ref(),
                 dbus_policy_path.to_string_lossy().as_ref(),
             ])
             .await?;
@@ -122,9 +125,6 @@ impl SystemdUserRuntime {
             })
         }
         .await;
-
-        let _ = fs::remove_file(&temp_unit_path).await;
-        let _ = fs::remove_file(&temp_policy_path).await;
 
         if install_result.is_err() {
             let _ = self.rollback_failed_install(&fragment_path).await;
