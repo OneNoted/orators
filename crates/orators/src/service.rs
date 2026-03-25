@@ -194,8 +194,12 @@ impl<R: PlatformRuntime> OratorsService<R> {
     }
 
     pub async fn connect_device(&self, address: &str) -> Result<String> {
-        self.runtime.ensure_host_media_ready().await?;
         self.refresh_status().await?;
+        {
+            let state = self.state.lock().await;
+            state.can_connect_device(address)?;
+        }
+        self.runtime.ensure_host_media_ready().await?;
         self.runtime.connect_device(address).await?;
         let status = self.refresh_status().await?;
         serialize(&status)
@@ -340,6 +344,7 @@ mod tests {
     struct MockRuntime {
         devices: tokio::sync::Mutex<Vec<DeviceInfo>>,
         disconnects: tokio::sync::Mutex<Vec<String>>,
+        connects: tokio::sync::Mutex<Vec<String>>,
         stop_pairing_calls: tokio::sync::Mutex<usize>,
     }
 
@@ -348,6 +353,7 @@ mod tests {
             Self {
                 devices: tokio::sync::Mutex::new(devices),
                 disconnects: tokio::sync::Mutex::new(Vec::new()),
+                connects: tokio::sync::Mutex::new(Vec::new()),
                 stop_pairing_calls: tokio::sync::Mutex::new(0),
             }
         }
@@ -403,6 +409,7 @@ mod tests {
         }
 
         async fn connect_device(&self, address: &str) -> Result<()> {
+            self.connects.lock().await.push(address.to_string());
             if let Some(device) = self
                 .devices
                 .lock()
@@ -539,5 +546,18 @@ mod tests {
 
         assert!(status.devices[0].trusted);
         assert!(status.devices[0].auto_reconnect);
+    }
+
+    #[tokio::test]
+    async fn second_connect_is_rejected_before_runtime_call() {
+        let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA"), sample_device("BB")]));
+        let service = OratorsService::new(runtime.clone(), OratorsConfig::default());
+
+        service.connect_device("AA").await.unwrap();
+        let error = service.connect_device("BB").await.unwrap_err();
+
+        assert!(error.to_string().contains("already active"));
+        let connects = runtime.connects.lock().await.clone();
+        assert_eq!(connects, vec!["AA".to_string()]);
     }
 }

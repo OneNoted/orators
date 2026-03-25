@@ -125,6 +125,14 @@ impl OratorsState {
     }
 
     pub fn connect_device(&mut self, address: &str, profile: BluetoothProfile) -> Result<()> {
+        let device = self.ensure_connectable(address)?;
+        device.connected = true;
+        device.active_profile = Some(profile);
+        self.active_device = Some(address.to_string());
+        Ok(())
+    }
+
+    pub fn can_connect_device(&self, address: &str) -> Result<()> {
         if self.config.single_active_device
             && self
                 .active_device
@@ -136,13 +144,9 @@ impl OratorsState {
             ));
         }
 
-        let device = self
-            .devices
-            .get_mut(address)
+        self.devices
+            .get(address)
             .ok_or_else(|| OratorsError::UnknownDevice(address.to_string()))?;
-        device.connected = true;
-        device.active_profile = Some(profile);
-        self.active_device = Some(address.to_string());
         Ok(())
     }
 
@@ -194,6 +198,13 @@ impl OratorsState {
             audio: self.audio.clone(),
             backend: self.backend.clone(),
         }
+    }
+
+    fn ensure_connectable(&mut self, address: &str) -> Result<&mut DeviceInfo> {
+        self.can_connect_device(address)?;
+        self.devices
+            .get_mut(address)
+            .ok_or_else(|| OratorsError::UnknownDevice(address.to_string()))
     }
 }
 
