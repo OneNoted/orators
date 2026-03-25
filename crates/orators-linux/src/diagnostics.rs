@@ -3,7 +3,7 @@ use orators_core::{DiagnosticCheck, DiagnosticsReport, Severity};
 
 use crate::{
     audio::{BluetoothCard, BluetoothRuntimeSettings, PipeWireDefaults, WpctlAudioRuntime},
-    bluez::{AdapterInfo, BluetoothCtlBluez},
+    bluez::{AdapterInfo, BluetoothCtlBluez, remote_device_supports_media},
     systemd::{SystemdUserRuntime, UserServiceStatus},
 };
 
@@ -66,10 +66,14 @@ pub async fn collect_report(
 
     let bluetooth_cards = audio.bluetooth_cards().await.ok();
     let active_device = bluez
-        .list_devices(true)
+        .remote_devices()
         .await
         .ok()
-        .and_then(|devices| devices.into_iter().find(|device| device.connected));
+        .and_then(|devices| {
+            devices
+                .into_iter()
+                .find(|device| device.connected && remote_device_supports_media(device))
+        });
     checks.push(active_profile_check(
         active_device.as_ref().map(|device| device.address.as_str()),
         bluetooth_cards.as_deref(),
@@ -88,25 +92,12 @@ pub async fn collect_report(
 }
 
 fn media_role_check(adapter: Option<&AdapterInfo>) -> DiagnosticCheck {
-    let supported = adapter.is_some_and(adapter_supports_media);
     DiagnosticCheck {
         code: "bluez.media_roles".to_string(),
-        severity: if supported {
-            Severity::Info
-        } else {
-            Severity::Error
-        },
-        summary: if supported {
-            "The stock Bluetooth stack advertises Audio Sink / A2DP media support".to_string()
-        } else {
-            "The stock Bluetooth stack does not advertise Audio Sink / A2DP media support"
-                .to_string()
-        },
+        severity: Severity::Info,
+        summary: "Bluetooth adapter UUIDs were discovered".to_string(),
         detail: adapter.map(|adapter| format!("Advertised adapter UUIDs: {}.", adapter.uuids.join(", "))),
-        remediation: (!supported).then_some(
-            "Fix the host Bluetooth audio stack outside Orators before pairing or connecting media devices."
-                .to_string(),
-        ),
+        remediation: None,
     }
 }
 
@@ -427,7 +418,7 @@ fn host_support_check(
     defaults: Option<&PipeWireDefaults>,
     wireplumber: Option<&UserServiceStatus>,
 ) -> DiagnosticCheck {
-    let ready = adapter.is_some_and(adapter_supports_media)
+    let ready = adapter.is_some()
         && defaults
             .is_some_and(|defaults| defaults.output_device.is_some() && !defaults.output_is_dummy)
         && wireplumber
@@ -473,13 +464,6 @@ fn adapter_check(info: AdapterInfo) -> DiagnosticCheck {
         )),
         remediation: None,
     }
-}
-
-fn adapter_supports_media(adapter: &AdapterInfo) -> bool {
-    adapter.uuids.iter().any(|uuid| {
-        uuid.eq_ignore_ascii_case("0000110b-0000-1000-8000-00805f9b34fb")
-            || uuid.eq_ignore_ascii_case("0000110d-0000-1000-8000-00805f9b34fb")
-    })
 }
 
 fn adapter_exposes_call_roles(adapter: &AdapterInfo) -> bool {

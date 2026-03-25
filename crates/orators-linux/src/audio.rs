@@ -144,6 +144,28 @@ impl WpctlAudioRuntime {
         Ok(())
     }
 
+    pub async fn wait_for_bluetooth_audio_card(
+        &self,
+        address: &str,
+        timeout: Duration,
+    ) -> Result<Option<BluetoothCard>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(cards) = self.bluetooth_cards().await {
+                if let Some(card) = cards.into_iter().find(|card| card_matches_address(card, address))
+                {
+                    return Ok(Some(card));
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     async fn read_runtime_setting_bool(&self, key: &str) -> Result<Option<bool>> {
         let output = run_command("wpctl", &["settings", key]).await?;
         if !output.status.success() {

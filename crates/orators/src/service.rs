@@ -118,7 +118,6 @@ impl<R: PlatformRuntime> OratorsService<R> {
 
     pub async fn start_pairing(&self, timeout_secs: Option<u64>) -> Result<String> {
         let timeout_secs = timeout_secs.unwrap_or_else(|| self.default_timeout());
-        self.runtime.ensure_host_media_ready().await?;
         self.runtime.start_pairing(timeout_secs).await?;
 
         let now = now_epoch_secs();

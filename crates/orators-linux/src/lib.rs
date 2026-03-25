@@ -5,11 +5,13 @@ pub mod systemd;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use orators_core::{AudioDefaults, DeviceInfo, DiagnosticsReport, OratorsConfig};
 
 use crate::{
-    audio::WpctlAudioRuntime, bluez::BluetoothCtlBluez, diagnostics::collect_report,
+    audio::WpctlAudioRuntime,
+    bluez::{BluetoothCtlBluez, remote_device_supports_media},
+    diagnostics::collect_report,
     systemd::SystemdUserRuntime,
 };
 
@@ -42,7 +44,7 @@ impl LinuxPlatform {
     }
 
     pub async fn start_pairing(&self, timeout_secs: u64) -> Result<()> {
-        self.ensure_host_media_ready().await?;
+        self.ensure_pairing_ready().await?;
         self.bluez.start_pairing(timeout_secs).await
     }
 
@@ -65,6 +67,21 @@ impl LinuxPlatform {
     pub async fn connect_device(&self, address: &str) -> Result<()> {
         self.ensure_host_media_ready().await?;
         self.bluez.connect_device(address).await
+            .with_context(|| format!("failed to initiate Bluetooth connection for {address}"))?;
+
+        if self
+            .audio
+            .wait_for_bluetooth_audio_card(address, std::time::Duration::from_secs(8))
+            .await?
+            .is_none()
+        {
+            let _ = self.bluez.disconnect_device(address).await;
+            anyhow::bail!(
+                "the phone connected over Bluetooth, but the host never surfaced a matching Bluetooth audio card"
+            );
+        }
+
+        Ok(())
     }
 
     pub async fn disconnect_device(&self, address: &str) -> Result<()> {
@@ -75,16 +92,20 @@ impl LinuxPlatform {
         let adapter = self.bluez.adapter_info().await.ok();
         let active_device = self
             .bluez
-            .list_devices(self.config.auto_reconnect)
+            .remote_devices()
             .await
             .ok()
-            .and_then(|devices| devices.into_iter().find(|device| device.connected))
+            .and_then(|devices| {
+                devices
+                    .into_iter()
+                    .find(|device| device.connected && remote_device_supports_media(device))
+            })
             .map(|device| device.address);
 
         let defaults = self
             .audio
             .current_defaults(
-                adapter.as_ref().is_some_and(adapter_supports_media),
+                adapter.is_some(),
                 adapter.as_ref().is_some_and(adapter_exposes_call_roles),
                 active_device.as_deref(),
             )
@@ -93,12 +114,7 @@ impl LinuxPlatform {
     }
 
     pub async fn ensure_host_media_ready(&self) -> Result<()> {
-        let adapter = self.bluez.adapter_info().await?;
-        if !adapter_supports_media(&adapter) {
-            anyhow::bail!(
-                "the stock Bluetooth stack does not advertise Audio Sink / A2DP media support"
-            );
-        }
+        self.ensure_pairing_ready().await?;
 
         let wireplumber = self.systemd.service_status("wireplumber.service").await?;
         if wireplumber.active_state != "active" || wireplumber.sub_state != "running" {
@@ -145,6 +161,14 @@ impl LinuxPlatform {
     pub async fn install_user_service(&self, daemon_path: &Path) -> Result<PathBuf> {
         self.systemd.install_user_service(daemon_path).await
     }
+
+    async fn ensure_pairing_ready(&self) -> Result<()> {
+        self.bluez
+            .adapter_info()
+            .await
+            .context("no BlueZ adapter is available for pairing")?;
+        Ok(())
+    }
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -152,13 +176,6 @@ pub fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn adapter_supports_media(adapter: &crate::bluez::AdapterInfo) -> bool {
-    adapter.uuids.iter().any(|uuid| {
-        uuid.eq_ignore_ascii_case("0000110b-0000-1000-8000-00805f9b34fb")
-            || uuid.eq_ignore_ascii_case("0000110d-0000-1000-8000-00805f9b34fb")
-    })
 }
 
 fn adapter_exposes_call_roles(adapter: &crate::bluez::AdapterInfo) -> bool {

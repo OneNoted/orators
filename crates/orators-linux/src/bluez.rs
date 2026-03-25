@@ -45,6 +45,12 @@ pub struct RemoteDeviceInfo {
     pub uuids: Vec<String>,
 }
 
+pub fn remote_device_supports_media(device: &RemoteDeviceInfo) -> bool {
+    device.uuids.iter().any(|uuid| {
+        uuid.eq_ignore_ascii_case(A2DP_SOURCE_UUID) || uuid.eq_ignore_ascii_case(A2DP_SINK_UUID)
+    })
+}
+
 pub struct BluetoothCtlBluez {
     connection: Connection,
     agent_state: Arc<PairingAgentState>,
@@ -227,7 +233,6 @@ impl BluetoothCtlBluez {
     }
 
     pub async fn connect_device(&self, address: &str) -> Result<()> {
-        let managed = self.managed_objects().await?;
         let device_path = self.device_path(address).await?;
         let device = Proxy::new(
             &self.connection,
@@ -237,24 +242,10 @@ impl BluetoothCtlBluez {
         )
         .await
         .with_context(|| format!("failed to create BlueZ device proxy for {address}"))?;
-        let media_uuid = managed
-            .get(&device_path)
-            .and_then(|interfaces| interfaces.get("org.bluez.Device1"))
-            .and_then(|properties| string_array_prop(properties, "UUIDs"))
-            .as_deref()
-            .and_then(select_media_profile_uuid);
-
-        if let Some(media_uuid) = media_uuid {
-            device
-                .call_method("ConnectProfile", &(media_uuid))
-                .await
-                .with_context(|| format!("failed to connect media profile for device {address}"))?;
-        } else {
-            device
-                .call_method("Connect", &())
-                .await
-                .with_context(|| format!("failed to connect device {address}"))?;
-        }
+        device
+            .call_method("Connect", &())
+            .await
+            .with_context(|| format!("failed to connect device {address}"))?;
         Ok(())
     }
 
@@ -559,22 +550,6 @@ fn profile_from_uuid(uuid: &str) -> Option<BluetoothProfile> {
     }
 }
 
-fn select_media_profile_uuid(uuids: &[String]) -> Option<&'static str> {
-    if uuids
-        .iter()
-        .any(|uuid| uuid.eq_ignore_ascii_case(A2DP_SOURCE_UUID))
-    {
-        Some(A2DP_SOURCE_UUID)
-    } else if uuids
-        .iter()
-        .any(|uuid| uuid.eq_ignore_ascii_case(A2DP_SINK_UUID))
-    {
-        Some(A2DP_SINK_UUID)
-    } else {
-        None
-    }
-}
-
 fn authorize_device_state(
     pairing_window_open: bool,
     device: DeviceAuthorizationState,
@@ -642,8 +617,9 @@ mod tests {
     use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Str};
 
     use super::{
-        A2DP_SINK_UUID, A2DP_SOURCE_UUID, AdapterInfo, AgentError, DeviceAuthorizationState,
-        authorize_device_state, parse_device, parse_transport_profile, select_media_profile_uuid,
+        A2DP_SOURCE_UUID, AdapterInfo, AgentError, DeviceAuthorizationState,
+        RemoteDeviceInfo, authorize_device_state, parse_device, parse_transport_profile,
+        remote_device_supports_media,
     };
 
     #[test]
@@ -745,30 +721,6 @@ mod tests {
     }
 
     #[test]
-    fn prefers_a2dp_source_uuid_when_available() {
-        let uuids = vec![
-            "0000110b-0000-1000-8000-00805f9b34fb".to_string(),
-            "0000110a-0000-1000-8000-00805f9b34fb".to_string(),
-        ];
-
-        assert_eq!(select_media_profile_uuid(&uuids), Some(A2DP_SOURCE_UUID));
-    }
-
-    #[test]
-    fn falls_back_to_a2dp_sink_uuid_when_source_is_missing() {
-        let uuids = vec!["0000110b-0000-1000-8000-00805f9b34fb".to_string()];
-
-        assert_eq!(select_media_profile_uuid(&uuids), Some(A2DP_SINK_UUID));
-    }
-
-    #[test]
-    fn returns_none_when_no_media_uuid_is_available() {
-        let uuids = vec!["00001108-0000-1000-8000-00805f9b34fb".to_string()];
-
-        assert_eq!(select_media_profile_uuid(&uuids), None);
-    }
-
-    #[test]
     fn adapter_info_captures_pairing_state() {
         let info = AdapterInfo {
             address: Some("04:7F:0E:02:13:3C".to_string()),
@@ -784,5 +736,26 @@ mod tests {
         assert!(info.powered);
         assert!(info.discoverable);
         assert_eq!(info.alias.as_deref(), Some("aeolus"));
+    }
+
+    #[test]
+    fn identifies_audio_capable_remote_devices() {
+        let phone = RemoteDeviceInfo {
+            address: "AA".to_string(),
+            alias: Some("Phone".to_string()),
+            paired: true,
+            connected: true,
+            uuids: vec![A2DP_SOURCE_UUID.to_string()],
+        };
+        let keyboard = RemoteDeviceInfo {
+            address: "BB".to_string(),
+            alias: Some("Keyboard".to_string()),
+            paired: true,
+            connected: true,
+            uuids: vec!["00001812-0000-1000-8000-00805f9b34fb".to_string()],
+        };
+
+        assert!(remote_device_supports_media(&phone));
+        assert!(!remote_device_supports_media(&keyboard));
     }
 }

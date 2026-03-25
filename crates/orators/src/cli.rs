@@ -61,6 +61,11 @@ pub enum DeviceCommand {
     Disallow { mac: String },
     Trust { mac: String },
     Forget { mac: String },
+    Reset {
+        mac: String,
+        #[arg(long)]
+        drop_allowlist: bool,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -136,6 +141,36 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
             DeviceCommand::Forget { mac } => {
                 let output = client.forget_device(&mac).await?;
                 render_status_output(output, json, "Device removed.")?;
+            }
+            DeviceCommand::Reset {
+                mac,
+                drop_allowlist,
+            } => {
+                let mac = normalize_device_address(&mac);
+                if drop_allowlist {
+                    update_allowlist(&mac, false)?;
+                }
+                let status = client.status().await?;
+                let status: RuntimeStatus = serde_json::from_str(&status)?;
+                if status.active_device.as_deref() == Some(mac.as_str()) {
+                    let _ = client.disconnect_active().await;
+                }
+                let output = client.forget_device(&mac).await?;
+                if json {
+                    print_jsonish(&output)?;
+                } else {
+                    let status: RuntimeStatus = serde_json::from_str(&output)?;
+                    println!("Device reset on the host.");
+                    if drop_allowlist {
+                        println!("Allowlist entry removed.");
+                    } else {
+                        println!("Allowlist entry preserved.");
+                    }
+                    println!(
+                        "Next: If you also removed it on the phone, run `oratorsctl pair start --timeout 120` and pair again."
+                    );
+                    render_status(&status, None);
+                }
             }
         },
         Command::Connect { mac } => {
@@ -548,8 +583,8 @@ fn explain_dbus_error(action: &str, error: zbus::Error) -> anyhow::Error {
     let detail = error.to_string();
     let next_step = if detail.contains("pairing window is closed") {
         "Run `oratorsctl pair start --timeout 120` before pairing a new device."
-    } else if detail.contains("does not advertise Audio Sink / A2DP media support") {
-        "Run `oratorsctl doctor` and fix the host Bluetooth audio stack outside Orators."
+    } else if detail.contains("never surfaced a matching Bluetooth audio card") {
+        "Reconnect the phone and retry. If it still fails, run `oratorsctl devices reset <MAC>` and pair again."
     } else if detail.contains("usable default sink") || detail.contains("wireplumber.service") {
         "Run `oratorsctl doctor` and repair the host audio session before retrying."
     } else if detail.contains("RequestDefaultAgent") {
