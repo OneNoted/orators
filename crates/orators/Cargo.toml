@@ -10,9 +10,11 @@ version.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 dirs.workspace = true
 orators-core = { path = "../orators-core" }
 orators-linux = { path = "../orators-linux" }
+ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

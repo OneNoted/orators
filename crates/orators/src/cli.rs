@@ -1,17 +1,17 @@
-use std::{env, path::PathBuf};
+use std::{future::Future, pin::Pin};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use orators_core::{
-    BluetoothProfile, DiagnosticCheck, DiagnosticsReport, OratorsConfig, PlayerState,
-    RuntimeStatus, Severity, dbus, normalize_device_address,
+    AdapterMode, BluetoothProfile, DiagnosticCheck, DiagnosticsReport, OratorsConfig, PlayerState,
+    RuntimeStatus, Severity, normalize_device_address,
 };
-use orators_linux::LinuxPlatform;
-use orators_linux::systemd::SystemdUserRuntime;
+use orators_linux::systemd::SystemBackendAdapterMode;
 use serde_json::Value;
-use zbus::{Connection, Proxy, fdo::DBusProxy, names::BusName};
 
-use crate::daemon::{default_config_path, ensure_config_exists};
+use crate::control::{
+    ControllerClient, install_system_backend, install_user_service, uninstall_system_backend,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "oratorsctl", about = "Control the Orators daemon")]
@@ -28,6 +28,7 @@ pub enum Command {
     Status,
     Pair(PairArgs),
     Devices(DeviceArgs),
+    Config(ConfigArgs),
     Connect {
         mac: String,
     },
@@ -82,17 +83,89 @@ pub enum DeviceCommand {
         #[arg(long)]
         drop_allowlist: bool,
     },
+    Alias {
+        mac: String,
+        name: String,
+    },
+    Unalias {
+        mac: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    Show,
+    Set {
+        #[command(subcommand)]
+        setting: ConfigSetCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigSetCommand {
+    PairingTimeout { seconds: u64 },
+    AutoReconnect { enabled: bool },
+    SingleActiveDevice { enabled: bool },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::InstallUserService => install_user_service(cli.json).await,
+        Command::InstallUserService => install_user_service_command(cli.json).await,
         Command::InstallSystemBackend { adapter } => {
-            install_system_backend(cli.json, adapter).await
+            install_system_backend_command(cli.json, adapter).await
         }
-        Command::UninstallSystemBackend => uninstall_system_backend(cli.json).await,
+        Command::UninstallSystemBackend => uninstall_system_backend_command(cli.json).await,
         Command::Doctor => run_doctor(cli.json).await,
         command => run_daemon_command(command, cli.json).await,
+    }
+}
+
+trait DeviceResetClient {
+    fn disallow_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+    fn status<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+    fn disconnect_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+    fn forget_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+}
+
+impl DeviceResetClient for ControllerClient {
+    fn disallow_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move { ControllerClient::disallow_device(self, address).await })
+    }
+
+    fn status<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move { ControllerClient::status(self).await })
+    }
+
+    fn disconnect_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move { ControllerClient::disconnect_device(self, address).await })
+    }
+
+    fn forget_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move { ControllerClient::forget_device(self, address).await })
     }
 }
 
@@ -144,14 +217,12 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
             }
             DeviceCommand::Allow { mac } => {
                 let mac = normalize_device_address(&mac);
-                update_allowlist(&mac, true)?;
-                let output = client.trust_device(&mac).await?;
+                let output = client.allow_device(&mac).await?;
                 render_status_output(output, json, "Device added to allowlist.")?;
             }
             DeviceCommand::Disallow { mac } => {
                 let mac = normalize_device_address(&mac);
-                update_allowlist(&mac, false)?;
-                let output = client.untrust_device(&mac).await?;
+                let output = client.disallow_device(&mac).await?;
                 render_status_output(output, json, "Device removed from allowlist.")?;
             }
             DeviceCommand::Trust { mac } => {
@@ -167,15 +238,7 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
                 drop_allowlist,
             } => {
                 let mac = normalize_device_address(&mac);
-                if drop_allowlist {
-                    update_allowlist(&mac, false)?;
-                }
-                let status = client.status().await?;
-                let status: RuntimeStatus = serde_json::from_str(&status)?;
-                if status.active_device.as_deref() == Some(mac.as_str()) {
-                    let _ = client.disconnect_active().await;
-                }
-                let output = client.forget_device(&mac).await?;
+                let output = reset_device(&client, &mac, drop_allowlist).await?;
                 if json {
                     print_jsonish(&output)?;
                 } else {
@@ -190,6 +253,52 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
                         "Next: If you also removed it on the phone, run `oratorsctl pair start --timeout 120` and pair again."
                     );
                     render_status(&status, None);
+                }
+            }
+            DeviceCommand::Alias { mac, name } => {
+                let mac = normalize_device_address(&mac);
+                let output = client.set_device_alias(&mac, &name).await?;
+                render_status_output(output, json, "Local device alias updated.")?;
+            }
+            DeviceCommand::Unalias { mac } => {
+                let mac = normalize_device_address(&mac);
+                let output = client.clear_device_alias(&mac).await?;
+                render_status_output(output, json, "Local device alias cleared.")?;
+            }
+        },
+        Command::Config(args) => match args.command {
+            ConfigCommand::Show => {
+                let config = client.get_config_or_local().await?;
+                if json {
+                    print_jsonish(&config.json)?;
+                } else {
+                    let config_value: OratorsConfig = serde_json::from_str(&config.json)?;
+                    if !config.daemon_backed {
+                        println!(
+                            "Daemon does not expose GetConfig yet; showing the local config file instead."
+                        );
+                    }
+                    render_config(&config_value);
+                }
+            }
+            ConfigCommand::Set { setting } => {
+                let output = match setting {
+                    ConfigSetCommand::PairingTimeout { seconds } => {
+                        client.set_pairing_timeout(seconds).await?
+                    }
+                    ConfigSetCommand::AutoReconnect { enabled } => {
+                        client.set_auto_reconnect(enabled).await?
+                    }
+                    ConfigSetCommand::SingleActiveDevice { enabled } => {
+                        client.set_single_active_device(enabled).await?
+                    }
+                };
+                if json {
+                    print_jsonish(&output)?;
+                } else {
+                    let config: OratorsConfig = serde_json::from_str(&output)?;
+                    println!("Configuration updated.");
+                    render_config(&config);
                 }
             }
         },
@@ -209,6 +318,27 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
     Ok(())
 }
 
+async fn reset_device<C: DeviceResetClient + ?Sized>(
+    client: &C,
+    mac: &str,
+    drop_allowlist: bool,
+) -> Result<String> {
+    let status = if drop_allowlist {
+        client.disallow_device(mac).await?
+    } else {
+        client.status().await?
+    };
+    let status: RuntimeStatus = serde_json::from_str(&status)?;
+    if status
+        .devices
+        .iter()
+        .any(|device| device.address == mac && device.connected)
+    {
+        client.disconnect_device(mac).await?;
+    }
+    client.forget_device(mac).await
+}
+
 async fn run_doctor(json: bool) -> Result<()> {
     let client = ControllerClient::connect().await?;
     let diagnostics = client.get_diagnostics().await?;
@@ -221,12 +351,8 @@ async fn run_doctor(json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn install_user_service(json: bool) -> Result<()> {
-    let config_path = default_config_path()?;
-    ensure_config_exists(&config_path)?;
-    let daemon_path = resolve_daemon_path()?;
-    let systemd = SystemdUserRuntime;
-    let unit_path = systemd.install_user_service(&daemon_path).await?;
+async fn install_user_service_command(json: bool) -> Result<()> {
+    let unit_path = install_user_service().await?;
 
     if json {
         println!("{}", unit_path.display());
@@ -237,21 +363,8 @@ async fn install_user_service(json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn install_system_backend(json: bool, adapter: Option<String>) -> Result<()> {
-    let config_path = default_config_path()?;
-    let mut config = ensure_config_exists(&config_path)?;
-    let mut effective_config = config.clone();
-    if let Some(adapter) = adapter.clone() {
-        effective_config.adapter = Some(adapter.to_ascii_lowercase());
-    }
-
-    let daemon_path = resolve_daemon_path()?;
-    let runtime = LinuxPlatform::new(effective_config).await?;
-    let user_unit_path = runtime.install_user_service(&daemon_path).await?;
-    let install = runtime.install_system_backend(adapter.as_deref()).await?;
-
-    config.adapter = Some(install.adapter.clone());
-    config.save(&config_path)?;
+async fn install_system_backend_command(json: bool, adapter: Option<String>) -> Result<()> {
+    let (user_unit_path, install) = install_system_backend(adapter).await?;
 
     if json {
         let payload = serde_json::json!({
@@ -259,7 +372,11 @@ async fn install_system_backend(json: bool, adapter: Option<String>) -> Result<(
             "wireplumber_fragment_path": install.wireplumber_fragment_path,
             "dbus_policy_path": install.dbus_policy_path,
             "system_unit_path": install.system_unit_path,
-            "adapter": install.adapter,
+            "adapter_mode": match install.adapter_mode {
+                SystemBackendAdapterMode::Auto => "auto",
+                SystemBackendAdapterMode::Explicit => "explicit",
+            },
+            "resolved_adapter": install.resolved_adapter,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -276,18 +393,22 @@ async fn install_system_backend(json: bool, adapter: Option<String>) -> Result<(
             "Installed BlueALSA system backend at {}.",
             install.system_unit_path.display()
         );
-        println!("Selected Bluetooth adapter: {}.", install.adapter);
+        println!(
+            "Backend adapter mode: {}.",
+            match install.adapter_mode {
+                SystemBackendAdapterMode::Auto => "auto",
+                SystemBackendAdapterMode::Explicit => "explicit",
+            }
+        );
+        println!("Resolved Bluetooth adapter: {}.", install.resolved_adapter);
         println!("Restart WirePlumber and the Orators daemon to activate the backend.");
     }
 
     Ok(())
 }
 
-async fn uninstall_system_backend(json: bool) -> Result<()> {
-    let config_path = default_config_path()?;
-    let config = ensure_config_exists(&config_path)?;
-    let runtime = LinuxPlatform::new(config).await?;
-    runtime.uninstall_system_backend().await?;
+async fn uninstall_system_backend_command(json: bool) -> Result<()> {
+    uninstall_system_backend().await?;
 
     if json {
         println!("{{\"removed\":true}}");
@@ -296,27 +417,6 @@ async fn uninstall_system_backend(json: bool) -> Result<()> {
         println!("WirePlumber Bluetooth ownership was restored.");
     }
 
-    Ok(())
-}
-
-fn resolve_daemon_path() -> Result<PathBuf> {
-    let current_exe = env::current_exe().context("failed to resolve current executable path")?;
-    let daemon_path = current_exe
-        .parent()
-        .context("current executable has no parent directory")?
-        .join("oratorsd");
-    Ok(daemon_path)
-}
-
-fn update_allowlist(address: &str, allow: bool) -> Result<()> {
-    let config_path = default_config_path()?;
-    let mut config = OratorsConfig::load_or_default(&config_path)?;
-    if allow {
-        config.allow_device(address);
-    } else {
-        config.disallow_device(address);
-    }
-    config.save(&config_path)?;
     Ok(())
 }
 
@@ -337,6 +437,26 @@ fn render_status_output(output: String, json: bool, prefix: &str) -> Result<()> 
         render_status(&status, None);
     }
     Ok(())
+}
+
+fn render_config(config: &OratorsConfig) {
+    println!("Pairing timeout: {}s", config.pairing_timeout_secs);
+    println!("Auto reconnect: {}", yes_no(config.auto_reconnect));
+    println!(
+        "Single active device: {}",
+        yes_no(config.single_active_device)
+    );
+    println!(
+        "Configured adapter: {}",
+        config.adapter.as_deref().unwrap_or("auto")
+    );
+    println!("Allowed devices: {}", config.allowed_devices.len());
+    if !config.device_aliases.is_empty() {
+        println!("Local aliases:");
+        for (address, alias) in &config.device_aliases {
+            println!("- {address}: {alias}");
+        }
+    }
 }
 
 fn render_pairing_started(status: &RuntimeStatus, diagnostics: Option<&DiagnosticsReport>) {
@@ -447,6 +567,19 @@ fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&Diagnostics
     );
     println!("Backend installed: {}", yes_no(status.backend.installed),);
     println!(
+        "Backend adapter mode: {}",
+        match status.backend.adapter_mode {
+            AdapterMode::Auto => "auto",
+            AdapterMode::Explicit => "explicit",
+        }
+    );
+    if let Some(adapter) = status.backend.resolved_adapter.as_deref() {
+        println!("Resolved adapter: {adapter}");
+    }
+    if let Some(adapter) = status.backend.configured_adapter.as_deref() {
+        println!("Configured adapter override: {adapter}");
+    }
+    println!(
         "Backend service ready: {}",
         yes_no(status.backend.system_service_ready),
     );
@@ -544,165 +677,136 @@ fn player_state_label(state: &PlayerState) -> &'static str {
     }
 }
 
-struct ControllerClient {
-    connection: Connection,
-}
+#[cfg(test)]
+mod tests {
+    use std::{future::Future, pin::Pin, sync::Mutex};
 
-impl ControllerClient {
-    async fn connect() -> Result<Self> {
-        let connection = Connection::session()
-            .await
-            .context("failed to connect to session bus")?;
-        ensure_daemon_running(&connection).await?;
-        Ok(Self { connection })
+    use anyhow::anyhow;
+    use orators_core::{AudioDefaults, DeviceInfo, MediaBackendStatus, PairingWindow};
+
+    use super::{DeviceResetClient, RuntimeStatus, reset_device};
+
+    type StubResult = std::result::Result<String, &'static str>;
+
+    struct FakeDeviceResetClient {
+        calls: Mutex<Vec<String>>,
+        disallow_result: StubResult,
+        status_result: StubResult,
+        disconnect_result: StubResult,
+        forget_result: StubResult,
     }
 
-    async fn status(&self) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("GetStatus", &())
-            .await
-            .map_err(|error| explain_dbus_error("get status", error))
-    }
-
-    async fn start_pairing(&self, timeout: u64) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("StartPairing", &(timeout,))
-            .await
-            .map_err(|error| explain_dbus_error("start pairing", error))
-    }
-
-    async fn stop_pairing(&self) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("StopPairing", &())
-            .await
-            .map_err(|error| explain_dbus_error("stop pairing", error))
-    }
-
-    async fn list_devices(&self) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("ListDevices", &())
-            .await
-            .map_err(|error| explain_dbus_error("list devices", error))
-    }
-
-    async fn trust_device(&self, address: &str) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("TrustDevice", &(address,))
-            .await
-            .map_err(|error| explain_dbus_error("trust device", error))
-    }
-
-    async fn untrust_device(&self, address: &str) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("UntrustDevice", &(address,))
-            .await
-            .map_err(|error| explain_dbus_error("untrust device", error))
-    }
-
-    async fn forget_device(&self, address: &str) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("ForgetDevice", &(address,))
-            .await
-            .map_err(|error| explain_dbus_error("forget device", error))
-    }
-
-    async fn connect_device(&self, address: &str) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("ConnectDevice", &(address,))
-            .await
-            .map_err(|error| explain_dbus_error("connect device", error))
-    }
-
-    async fn disconnect_active(&self) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("DisconnectActive", &())
-            .await
-            .map_err(|error| explain_dbus_error("disconnect active device", error))
-    }
-
-    async fn get_diagnostics(&self) -> Result<String> {
-        self.proxy()
-            .await?
-            .call("GetDiagnostics", &())
-            .await
-            .map_err(|error| explain_dbus_error("get diagnostics", error))
-    }
-
-    async fn proxy(&self) -> Result<Proxy<'_>> {
-        Proxy::new(
-            &self.connection,
-            dbus::BUS_NAME,
-            dbus::OBJECT_PATH,
-            dbus::CONTROL_INTERFACE,
-        )
-        .await
-        .context("failed to connect to Orators D-Bus interface")
-    }
-}
-
-async fn ensure_daemon_running(connection: &Connection) -> Result<()> {
-    let bus_name = BusName::try_from(dbus::BUS_NAME).context("invalid Orators D-Bus bus name")?;
-    let bus = DBusProxy::new(connection)
-        .await
-        .context("failed to connect to session D-Bus daemon")?;
-    if bus
-        .name_has_owner(bus_name.clone())
-        .await
-        .context("failed to query Orators D-Bus ownership")?
-    {
-        return Ok(());
-    }
-
-    SystemdUserRuntime
-        .start_orators_service()
-        .await
-        .context("failed to start oratorsd.service; run `oratorsctl install-user-service` first")?;
-
-    for _ in 0..12 {
-        if bus
-            .name_has_owner(bus_name.clone())
-            .await
-            .context("failed to re-check Orators D-Bus ownership")?
-        {
-            return Ok(());
+    impl DeviceResetClient for FakeDeviceResetClient {
+        fn disallow_device<'a>(
+            &'a self,
+            address: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
+            let result = self.disallow_result.clone().map_err(|error| anyhow!(error));
+            let address = address.to_string();
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("disallow:{address}"));
+                result
+            })
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        fn status<'a>(&'a self) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
+            let result = self.status_result.clone().map_err(|error| anyhow!(error));
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("status".to_string());
+                result
+            })
+        }
+
+        fn disconnect_device<'a>(
+            &'a self,
+            address: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
+            let result = self
+                .disconnect_result
+                .clone()
+                .map_err(|error| anyhow!(error));
+            let address = address.to_string();
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("disconnect:{address}"));
+                result
+            })
+        }
+
+        fn forget_device<'a>(
+            &'a self,
+            address: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
+            let result = self.forget_result.clone().map_err(|error| anyhow!(error));
+            let address = address.to_string();
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(format!("forget:{address}"));
+                result
+            })
+        }
     }
 
-    anyhow::bail!("oratorsd.service started, but the D-Bus control interface never appeared")
-}
+    fn status_json(active_device: Option<&str>) -> String {
+        serde_json::to_string(&RuntimeStatus {
+            pairing: PairingWindow {
+                enabled: false,
+                timeout_secs: 60,
+                expires_at_epoch_secs: None,
+            },
+            active_device: active_device.map(str::to_string),
+            devices: vec![DeviceInfo {
+                address: "AA".to_string(),
+                alias: Some("Phone".to_string()),
+                trusted: true,
+                paired: true,
+                connected: active_device == Some("AA"),
+                active_profile: None,
+                auto_reconnect: true,
+            }],
+            audio: AudioDefaults::default(),
+            backend: MediaBackendStatus::default(),
+        })
+        .unwrap()
+    }
 
-fn explain_dbus_error(action: &str, error: zbus::Error) -> anyhow::Error {
-    let detail = error.to_string();
-    let next_step = if detail.contains("pairing window is closed") {
-        "Run `oratorsctl pair start --timeout 120` before pairing a new device."
-    } else if detail.contains("BlueALSA")
-        || detail.contains("bluealsad")
-        || detail.contains("WirePlumber Bluetooth-disable fragment")
-    {
-        "Run `oratorsctl doctor`, then install or repair the managed backend with `oratorsctl install-system-backend`."
-    } else if detail.contains("ALSA does not currently expose") || detail.contains("`aplay`") {
-        "Run `oratorsctl doctor` and repair the host ALSA/PipeWire playback output before retrying."
-    } else if detail.contains("classic A2DP audio-source profile") {
-        "This device does not advertise classic Bluetooth media-source support, so it is not a supported speaker source."
-    } else if detail.contains("RequestDefaultAgent") {
-        "Close other Bluetooth pairing dialogs, then rerun `oratorsctl pair start`."
-    } else if detail.contains("no BlueZ adapter found") {
-        "Check that Bluetooth is present, powered on, and visible in `bluetoothctl show`."
-    } else if detail.contains("org.bluez.Error") {
-        "Run `oratorsctl doctor` and review the BlueZ service logs for the exact failure."
-    } else {
-        "Run `oratorsctl doctor` for more detail."
-    };
+    #[tokio::test]
+    async fn reset_with_drop_allowlist_propagates_disallow_errors() {
+        let client = FakeDeviceResetClient {
+            calls: Mutex::new(vec![]),
+            disallow_result: Err("disallow failed"),
+            status_result: Ok(status_json(Some("AA"))),
+            disconnect_result: Ok(status_json(None)),
+            forget_result: Ok(status_json(None)),
+        };
 
-    anyhow!("{action} failed: {detail}\nNext step: {next_step}")
+        let error = reset_device(&client, "AA", true).await.unwrap_err();
+
+        assert!(error.to_string().contains("disallow failed"));
+        assert_eq!(client.calls.lock().unwrap().as_slice(), ["disallow:AA"]);
+    }
+
+    #[tokio::test]
+    async fn reset_with_drop_allowlist_uses_disallow_status_and_forgets_device() {
+        let client = FakeDeviceResetClient {
+            calls: Mutex::new(vec![]),
+            disallow_result: Ok(status_json(Some("AA"))),
+            status_result: Ok(status_json(Some("AA"))),
+            disconnect_result: Ok(status_json(None)),
+            forget_result: Ok(status_json(None)),
+        };
+
+        let output = reset_device(&client, "AA", true).await.unwrap();
+        let status: RuntimeStatus = serde_json::from_str(&output).unwrap();
+
+        assert!(status.active_device.is_none());
+        assert_eq!(
+            client.calls.lock().unwrap().as_slice(),
+            ["disallow:AA", "disconnect:AA", "forget:AA"]
+        );
+    }
 }

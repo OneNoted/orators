@@ -79,15 +79,31 @@ impl LinuxPlatform {
             .await
             .with_context(|| format!("failed to initiate Bluetooth connection for {address}"))?;
 
-        self.bluez
+        if self
+            .bluez
             .wait_for_connected(address, std::time::Duration::from_secs(10))
             .await?
-            .then_some(())
-            .context("the phone did not reach a connected Bluetooth state within 10 seconds")
+        {
+            Ok(())
+        } else {
+            let _ = self.bluez.disconnect_device(address).await;
+            anyhow::bail!("the phone did not reach a connected Bluetooth state within 10 seconds")
+        }
     }
 
     pub async fn disconnect_device(&self, address: &str) -> Result<()> {
-        self.bluez.disconnect_device(address).await?;
+        if let Err(error) = self.bluez.disconnect_device(address).await {
+            let still_connected = self
+                .bluez
+                .remote_devices()
+                .await?
+                .into_iter()
+                .find(|device| device.address == address)
+                .is_some_and(|device| device.connected);
+            if still_connected {
+                return Err(error);
+            }
+        }
         self.reconcile_runtime().await
     }
 
@@ -101,7 +117,14 @@ impl LinuxPlatform {
         let service_ready = service_status
             .as_ref()
             .is_some_and(|status| status.active_state == "active" && status.sub_state == "running");
-        Ok(self.bluealsa.backend_status(installed, service_ready).await)
+        let resolved_adapter = self.bluez.resolved_adapter().await.ok();
+        let mut status = self.bluealsa.backend_status(installed, service_ready).await;
+        status.configured_adapter = self.config.adapter.clone();
+        if let Some(resolved) = resolved_adapter {
+            status.adapter_mode = resolved.mode;
+            status.resolved_adapter = Some(resolved.info.id);
+        }
+        Ok(status)
     }
 
     pub async fn ensure_host_media_ready(&self) -> Result<()> {
@@ -148,7 +171,6 @@ impl LinuxPlatform {
             &self.bluez,
             &self.audio,
             &self.systemd,
-            self.config.adapter.as_deref(),
             self.system_backend_status().await?,
         )
         .await
@@ -169,8 +191,14 @@ impl LinuxPlatform {
         }
 
         let assets = BluealsaAssets::discover()?;
-        let adapter = self.resolve_adapter(adapter).await?;
-        self.systemd.install_system_backend(&assets, &adapter).await
+        let adapter = self.resolve_install_adapter(adapter).await?;
+        self.systemd
+            .install_system_backend(
+                &assets,
+                adapter.system_backend_adapter(),
+                adapter.resolved_adapter(),
+            )
+            .await
     }
 
     pub async fn uninstall_system_backend(&self) -> Result<()> {
@@ -184,10 +212,7 @@ impl LinuxPlatform {
     }
 
     async fn ensure_backend_ready(&self) -> Result<()> {
-        self.bluez
-            .adapter_info()
-            .await
-            .context("no BlueZ adapter is available for pairing")?;
+        self.bluez.resolved_adapter().await?;
 
         if !self.systemd.wireplumber_fragment_installed()? {
             anyhow::bail!("the managed WirePlumber Bluetooth-disable fragment is not installed");
@@ -253,18 +278,61 @@ impl LinuxPlatform {
             .any(|device| device.connected && remote_device_supports_media(&device)))
     }
 
-    async fn resolve_adapter(&self, requested: Option<&str>) -> Result<String> {
-        if let Some(adapter) = requested.or(self.config.adapter.as_deref()) {
-            return Ok(adapter.to_ascii_lowercase());
-        }
-
+    async fn resolve_install_adapter(&self, requested: Option<&str>) -> Result<InstallAdapter> {
         let powered = self.bluez.powered_adapter_ids().await?;
         match powered.as_slice() {
-            [adapter] => Ok(adapter.clone()),
+            [adapter] => {
+                if let Some(requested) = requested {
+                    let requested = requested.to_ascii_lowercase();
+                    if requested != *adapter {
+                        anyhow::bail!(
+                            "requested Bluetooth adapter {requested} is not available; the only powered adapter is {adapter}"
+                        );
+                    }
+                }
+                Ok(InstallAdapter::Auto {
+                    resolved_adapter: adapter.clone(),
+                })
+            }
             [] => anyhow::bail!("no powered BlueZ adapter is available"),
-            _ => anyhow::bail!(
-                "multiple powered Bluetooth adapters were found; rerun install with --adapter hciX"
-            ),
+            _ => {
+                let available = powered.join(", ");
+                let adapter = requested
+                    .or(self.config.adapter.as_deref())
+                    .map(|adapter| adapter.to_ascii_lowercase())
+                    .context(
+                        "multiple powered Bluetooth adapters were found; rerun install with --adapter hciX",
+                    )?;
+
+                if powered.iter().any(|candidate| candidate == &adapter) {
+                    Ok(InstallAdapter::Explicit { adapter })
+                } else {
+                    anyhow::bail!(
+                        "configured Bluetooth adapter {adapter} is not available; powered adapters: {available}"
+                    )
+                }
+            }
+        }
+    }
+}
+
+enum InstallAdapter {
+    Auto { resolved_adapter: String },
+    Explicit { adapter: String },
+}
+
+impl InstallAdapter {
+    fn system_backend_adapter(&self) -> Option<&str> {
+        match self {
+            Self::Auto { .. } => None,
+            Self::Explicit { adapter } => Some(adapter.as_str()),
+        }
+    }
+
+    fn resolved_adapter(&self) -> &str {
+        match self {
+            Self::Auto { resolved_adapter } => resolved_adapter.as_str(),
+            Self::Explicit { adapter } => adapter.as_str(),
         }
     }
 }

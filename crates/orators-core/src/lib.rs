@@ -10,6 +10,6 @@ pub use diagnostics::{DiagnosticCheck, DiagnosticsReport, Severity};
 pub use error::{OratorsError, Result};
 pub use state::OratorsState;
 pub use types::{
-    AudioDefaults, BluetoothProfile, DeviceInfo, MediaBackendKind, MediaBackendStatus,
+    AdapterMode, AudioDefaults, BluetoothProfile, DeviceInfo, MediaBackendKind, MediaBackendStatus,
     PairingWindow, PlayerState, RuntimeStatus,
 };

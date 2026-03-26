@@ -87,9 +87,7 @@ impl BluealsaAssets {
         }
     }
 
-    fn discover_in_trusted_dirs<'a>(
-        dirs: impl IntoIterator<Item = &'a Path>,
-    ) -> Result<Self> {
+    fn discover_in_trusted_dirs<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Result<Self> {
         let mut discovery_error = None;
         for dir in dirs {
             if dir.exists() {
@@ -107,7 +105,9 @@ impl BluealsaAssets {
 
         match discovery_error {
             Some(error) => Err(error),
-            None => Err(anyhow::anyhow!("no trusted BlueALSA asset directories were found")),
+            None => Err(anyhow::anyhow!(
+                "no trusted BlueALSA asset directories were found"
+            )),
         }
     }
 
@@ -257,6 +257,7 @@ impl BluealsaRuntime {
             player_running: supervisor.current.is_some(),
             active_device_address: supervisor.current_address.clone(),
             last_error: supervisor.last_error.clone(),
+            ..MediaBackendStatus::default()
         }
     }
 }
@@ -431,11 +432,8 @@ mod tests {
             fs::set_permissions(&binary, permissions).unwrap();
         }
 
-        let assets = BluealsaAssets::discover_in_dirs([
-            invalid_dir.path(),
-            valid_dir.path(),
-        ])
-        .unwrap();
+        let assets =
+            BluealsaAssets::discover_in_dirs([invalid_dir.path(), valid_dir.path()]).unwrap();
 
         assert!(assets.bluealsad.starts_with(valid_dir.path()));
     }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use orators_core::{BluetoothProfile, DeviceInfo};
+use orators_core::{AdapterMode, BluetoothProfile, DeviceInfo};
 use zbus::{
     Connection, DBusError, Proxy,
     zvariant::{OwnedObjectPath, OwnedValue},
@@ -27,6 +27,7 @@ type ManagedObjects = HashMap<OwnedObjectPath, InterfaceProperties>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterInfo {
+    pub id: String,
     pub address: Option<String>,
     pub alias: Option<String>,
     pub name: Option<String>,
@@ -44,6 +45,13 @@ pub struct RemoteDeviceInfo {
     pub paired: bool,
     pub connected: bool,
     pub uuids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAdapter {
+    pub mode: AdapterMode,
+    pub info: AdapterInfo,
+    pub ignored_configured_adapter: Option<String>,
 }
 
 pub fn remote_device_supports_media(device: &RemoteDeviceInfo) -> bool {
@@ -87,42 +95,30 @@ impl BluetoothCtlBluez {
 
     pub async fn adapter_info(&self) -> Result<AdapterInfo> {
         let managed = self.managed_objects().await?;
-        let adapter = managed
-            .iter()
-            .find(|(path, interfaces)| {
-                interfaces.contains_key("org.bluez.Adapter1")
-                    && self.path_matches_preferred_adapter(path)
-            })
-            .and_then(|(_, interfaces)| interfaces.get("org.bluez.Adapter1"))
-            .context("no BlueZ adapter found")?;
+        Ok(self
+            .resolve_adapter_selection(parse_adapters(&managed))?
+            .info)
+    }
 
-        Ok(AdapterInfo {
-            address: string_prop(adapter, "Address"),
-            alias: string_prop(adapter, "Alias"),
-            name: string_prop(adapter, "Name"),
-            uuids: string_array_prop(adapter, "UUIDs").unwrap_or_default(),
-            powered: bool_prop(adapter, "Powered").unwrap_or(false),
-            discoverable: bool_prop(adapter, "Discoverable").unwrap_or(false),
-            pairable: bool_prop(adapter, "Pairable").unwrap_or(false),
-            discovering: bool_prop(adapter, "Discovering").unwrap_or(false),
-        })
+    pub async fn resolved_adapter(&self) -> Result<ResolvedAdapter> {
+        let managed = self.managed_objects().await?;
+        self.resolve_adapter_selection(parse_adapters(&managed))
     }
 
     pub async fn list_devices(&self, auto_reconnect: bool) -> Result<Vec<DeviceInfo>> {
         let managed = self.managed_objects().await?;
+        let adapter_id = self.resolve_adapter_id(&managed)?;
         Ok(parse_devices(
             &managed,
             auto_reconnect,
-            self.preferred_adapter.as_deref(),
+            Some(adapter_id.as_str()),
         ))
     }
 
     pub async fn remote_devices(&self) -> Result<Vec<RemoteDeviceInfo>> {
         let managed = self.managed_objects().await?;
-        Ok(parse_remote_devices(
-            &managed,
-            self.preferred_adapter.as_deref(),
-        ))
+        let adapter_id = self.resolve_adapter_id(&managed)?;
+        Ok(parse_remote_devices(&managed, Some(adapter_id.as_str())))
     }
 
     pub async fn all_remote_devices(&self) -> Result<Vec<RemoteDeviceInfo>> {
@@ -377,11 +373,12 @@ impl BluetoothCtlBluez {
 
     async fn adapter_path(&self) -> Result<OwnedObjectPath> {
         let managed = self.managed_objects().await?;
+        let adapter_id = self.resolve_adapter_id(&managed)?;
         managed
             .into_iter()
             .find_map(|(path, interfaces)| {
                 (interfaces.contains_key("org.bluez.Adapter1")
-                    && self.path_matches_preferred_adapter(&path))
+                    && path_has_adapter_segment(path.as_str(), &adapter_id))
                 .then_some(path)
             })
             .context("no BlueZ adapter found")
@@ -389,10 +386,11 @@ impl BluetoothCtlBluez {
 
     async fn device_path(&self, address: &str) -> Result<OwnedObjectPath> {
         let managed = self.managed_objects().await?;
+        let adapter_id = self.resolve_adapter_id(&managed)?;
         managed
             .into_iter()
             .find_map(|(path, interfaces)| {
-                if !self.path_matches_preferred_adapter(&path) {
+                if !path_has_adapter_segment(path.as_str(), &adapter_id) {
                     return None;
                 }
                 let props = interfaces.get("org.bluez.Device1")?;
@@ -402,10 +400,16 @@ impl BluetoothCtlBluez {
             .with_context(|| format!("no BlueZ device found for {address}"))
     }
 
-    fn path_matches_preferred_adapter(&self, path: &OwnedObjectPath) -> bool {
-        self.preferred_adapter
-            .as_deref()
-            .is_none_or(|adapter| path_has_adapter_segment(path.as_str(), adapter))
+    fn resolve_adapter_id(&self, managed: &ManagedObjects) -> Result<String> {
+        Ok(
+            resolve_adapter_selection(self.preferred_adapter.as_deref(), parse_adapters(managed))?
+                .info
+                .id,
+        )
+    }
+
+    fn resolve_adapter_selection(&self, adapters: Vec<AdapterInfo>) -> Result<ResolvedAdapter> {
+        resolve_adapter_selection(self.preferred_adapter.as_deref(), adapters)
     }
 }
 
@@ -554,7 +558,7 @@ fn parse_devices(
     managed
         .iter()
         .filter(|(path, _)| {
-            preferred_adapter.is_none_or(|adapter| path.as_str().contains(&format!("/{adapter}/")))
+            preferred_adapter.is_none_or(|adapter| path_has_adapter_segment(path.as_str(), adapter))
         })
         .filter_map(|(path, interfaces)| {
             interfaces.get("org.bluez.Device1").and_then(|properties| {
@@ -562,6 +566,69 @@ fn parse_devices(
             })
         })
         .collect()
+}
+
+fn parse_adapters(managed: &ManagedObjects) -> Vec<AdapterInfo> {
+    managed
+        .iter()
+        .filter_map(|(path, interfaces)| {
+            let adapter = interfaces.get("org.bluez.Adapter1")?;
+            Some(AdapterInfo {
+                id: adapter_id_from_path(path),
+                address: string_prop(adapter, "Address"),
+                alias: string_prop(adapter, "Alias"),
+                name: string_prop(adapter, "Name"),
+                uuids: string_array_prop(adapter, "UUIDs").unwrap_or_default(),
+                powered: bool_prop(adapter, "Powered").unwrap_or(false),
+                discoverable: bool_prop(adapter, "Discoverable").unwrap_or(false),
+                pairable: bool_prop(adapter, "Pairable").unwrap_or(false),
+                discovering: bool_prop(adapter, "Discovering").unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn resolve_adapter_selection(
+    preferred_adapter: Option<&str>,
+    adapters: Vec<AdapterInfo>,
+) -> Result<ResolvedAdapter> {
+    match adapters.as_slice() {
+        [] => anyhow::bail!("no BlueZ adapter found"),
+        [adapter] => Ok(ResolvedAdapter {
+            mode: AdapterMode::Auto,
+            info: adapter.clone(),
+            ignored_configured_adapter: preferred_adapter
+                .map(str::to_string)
+                .filter(|configured| configured != &adapter.id),
+        }),
+        _ => {
+            let available = adapters
+                .iter()
+                .map(|adapter| adapter.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            if let Some(configured) = preferred_adapter {
+                let adapter = adapters
+                    .into_iter()
+                    .find(|adapter| adapter.id == configured)
+                    .with_context(|| {
+                        format!(
+                            "configured BlueZ adapter {configured} is not available; detected adapters: {available}"
+                        )
+                    })?;
+                Ok(ResolvedAdapter {
+                    mode: AdapterMode::Explicit,
+                    info: adapter,
+                    ignored_configured_adapter: None,
+                })
+            } else {
+                anyhow::bail!(
+                    "multiple BlueZ adapters were detected; configure one of: {available}"
+                )
+            }
+        }
+    }
 }
 
 fn parse_device(
@@ -706,13 +773,13 @@ fn path_has_adapter_segment(path: &str, adapter: &str) -> bool {
 mod tests {
     use std::collections::HashMap;
 
-    use orators_core::BluetoothProfile;
+    use orators_core::{AdapterMode, BluetoothProfile};
     use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Str};
 
     use super::{
         A2DP_SOURCE_UUID, AdapterInfo, AgentError, DeviceAuthorizationState, RemoteDeviceInfo,
         authorize_device_state, parse_device, parse_remote_devices, parse_transport_profile,
-        path_has_adapter_segment, remote_device_supports_media,
+        path_has_adapter_segment, remote_device_supports_media, resolve_adapter_selection,
     };
 
     #[test]
@@ -816,6 +883,7 @@ mod tests {
     #[test]
     fn adapter_info_captures_pairing_state() {
         let info = AdapterInfo {
+            id: "hci0".to_string(),
             address: Some("04:7F:0E:02:13:3C".to_string()),
             alias: Some("aeolus".to_string()),
             name: Some("aeolus".to_string()),
@@ -829,6 +897,70 @@ mod tests {
         assert!(info.powered);
         assert!(info.discoverable);
         assert_eq!(info.alias.as_deref(), Some("aeolus"));
+    }
+
+    #[test]
+    fn single_adapter_ignores_stale_configured_override() {
+        let selection = resolve_adapter_selection(
+            Some("hci1"),
+            vec![AdapterInfo {
+                id: "hci0".to_string(),
+                address: Some("04:7F:0E:02:13:3C".to_string()),
+                alias: Some("aeolus".to_string()),
+                name: Some("aeolus".to_string()),
+                uuids: Vec::new(),
+                powered: true,
+                discoverable: false,
+                pairable: true,
+                discovering: false,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(selection.mode, AdapterMode::Auto);
+        assert_eq!(selection.info.id, "hci0");
+        assert_eq!(
+            selection.ignored_configured_adapter.as_deref(),
+            Some("hci1")
+        );
+    }
+
+    #[test]
+    fn multiple_adapters_require_explicit_selection() {
+        let error = resolve_adapter_selection(
+            None,
+            vec![
+                AdapterInfo {
+                    id: "hci0".to_string(),
+                    address: None,
+                    alias: None,
+                    name: None,
+                    uuids: Vec::new(),
+                    powered: true,
+                    discoverable: false,
+                    pairable: true,
+                    discovering: false,
+                },
+                AdapterInfo {
+                    id: "hci1".to_string(),
+                    address: None,
+                    alias: None,
+                    name: None,
+                    uuids: Vec::new(),
+                    powered: true,
+                    discoverable: false,
+                    pairable: true,
+                    discovering: false,
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("multiple BlueZ adapters were detected")
+        );
     }
 
     #[test]

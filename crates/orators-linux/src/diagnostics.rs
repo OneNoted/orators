@@ -4,7 +4,7 @@ use orators_core::{DiagnosticCheck, DiagnosticsReport, Severity};
 use crate::{
     audio::LocalAudioRuntime,
     bluealsa::{BluealsaAssets, SYSTEM_BACKEND_UNIT},
-    bluez::{AdapterInfo, BluetoothCtlBluez, remote_device_supports_media},
+    bluez::{BluetoothCtlBluez, ResolvedAdapter, remote_device_supports_media},
     systemd::{ServiceStatus, SystemdUserRuntime},
 };
 
@@ -12,15 +12,14 @@ pub async fn collect_report(
     bluez: &BluetoothCtlBluez,
     audio: &LocalAudioRuntime,
     systemd: &SystemdUserRuntime,
-    configured_adapter: Option<&str>,
     backend_service: Option<ServiceStatus>,
 ) -> Result<DiagnosticsReport> {
     let mut checks = Vec::new();
 
-    let adapter_info = match bluez.adapter_info().await {
-        Ok(info) => {
-            checks.push(adapter_check(&info, configured_adapter));
-            Some(info)
+    let adapter = match bluez.resolved_adapter().await {
+        Ok(adapter) => {
+            checks.push(adapter_check(&adapter));
+            Some(adapter)
         }
         Err(error) if error.to_string().contains("no BlueZ adapter found") => {
             checks.push(DiagnosticCheck {
@@ -32,6 +31,35 @@ pub async fn collect_report(
                 ),
                 remediation: Some(
                     "Make sure the Bluetooth controller is present and powered on.".to_string(),
+                ),
+            });
+            None
+        }
+        Err(error) if error.to_string().contains("configured BlueZ adapter") => {
+            checks.push(DiagnosticCheck {
+                code: "bluez.adapter".to_string(),
+                severity: Severity::Error,
+                summary: "The configured BlueZ adapter is not available".to_string(),
+                detail: Some(error.to_string()),
+                remediation: Some(
+                    "Clear the adapter override or reinstall the backend so Orators can pick the current adapter."
+                        .to_string(),
+                ),
+            });
+            None
+        }
+        Err(error)
+            if error
+                .to_string()
+                .contains("multiple BlueZ adapters were detected") =>
+        {
+            checks.push(DiagnosticCheck {
+                code: "bluez.adapter".to_string(),
+                severity: Severity::Error,
+                summary: "Multiple BlueZ adapters were detected".to_string(),
+                detail: Some(error.to_string()),
+                remediation: Some(
+                    "Select a specific adapter before installing or using the backend.".to_string(),
                 ),
             });
             None
@@ -66,7 +94,7 @@ pub async fn collect_report(
     checks.push(active_device_check(active_device.as_ref()));
 
     checks.push(backend_ready_check(
-        adapter_info.as_ref(),
+        adapter.as_ref(),
         BluealsaAssets::discover().ok().as_ref(),
         systemd.wireplumber_fragment_installed()?,
         backend_service.as_ref(),
@@ -79,22 +107,36 @@ pub async fn collect_report(
     })
 }
 
-fn adapter_check(adapter: &AdapterInfo, configured_adapter: Option<&str>) -> DiagnosticCheck {
-    let configured = configured_adapter
-        .map(|adapter_id| format!("Configured adapter: {adapter_id}. "))
-        .unwrap_or_default();
+fn adapter_check(adapter: &ResolvedAdapter) -> DiagnosticCheck {
+    let prefix = match (&adapter.mode, adapter.ignored_configured_adapter.as_deref()) {
+        (_, Some(ignored)) => format!(
+            "Saved adapter override {ignored} was ignored on this single-adapter system. Auto-detected {}. ",
+            adapter.info.id
+        ),
+        (orators_core::AdapterMode::Auto, None) => {
+            format!("Auto-detected adapter {}. ", adapter.info.id)
+        }
+        (orators_core::AdapterMode::Explicit, None) => {
+            format!("Using configured adapter {}. ", adapter.info.id)
+        }
+    };
+
     DiagnosticCheck {
         code: "bluez.adapter".to_string(),
-        severity: Severity::Info,
+        severity: if adapter.ignored_configured_adapter.is_some() {
+            Severity::Warn
+        } else {
+            Severity::Info
+        },
         summary: "BlueZ adapter is ready".to_string(),
         detail: Some(format!(
-            "{configured}Look for Bluetooth device '{}' ({}). powered={}, discoverable={}, pairable={}, scanning={}.",
-            adapter.alias.as_deref().unwrap_or("orators"),
-            adapter.address.as_deref().unwrap_or("unknown"),
-            adapter.powered,
-            adapter.discoverable,
-            adapter.pairable,
-            adapter.discovering
+            "{prefix}Look for Bluetooth device '{}' ({}). powered={}, discoverable={}, pairable={}, scanning={}.",
+            adapter.info.alias.as_deref().unwrap_or("orators"),
+            adapter.info.address.as_deref().unwrap_or("unknown"),
+            adapter.info.powered,
+            adapter.info.discoverable,
+            adapter.info.pairable,
+            adapter.info.discovering
         )),
         remediation: None,
     }
@@ -290,7 +332,7 @@ fn active_device_check(device: Option<&crate::bluez::RemoteDeviceInfo>) -> Diagn
 }
 
 fn backend_ready_check(
-    adapter: Option<&AdapterInfo>,
+    adapter: Option<&ResolvedAdapter>,
     assets: Option<&BluealsaAssets>,
     fragment_installed: bool,
     backend_service: Option<&ServiceStatus>,
