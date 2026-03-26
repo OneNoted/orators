@@ -13,6 +13,7 @@ use tokio::{process::Child, process::Command, sync::Mutex};
 
 const PLAYER_RESTART_BACKOFF: Duration = Duration::from_secs(3);
 const PLAYER_MAX_RESTARTS: u8 = 3;
+const PLAYER_VOLUME_MODE: &str = "--volume=software";
 pub const SYSTEM_BACKEND_UNIT: &str = "orators-bluealsad.service";
 const TRUSTED_BLUEALSA_DIRS: &[&str] = &[
     "/usr/libexec/orators/bluealsa",
@@ -207,15 +208,16 @@ impl BluealsaRuntime {
             .context("missing active device address for BlueALSA playback")?;
 
         let child = Command::new(&assets.bluealsa_aplay)
-            .arg(&address)
+            .args(player_args(&address))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| {
                 format!(
-                    "failed to start `{} {address}`",
-                    assets.bluealsa_aplay.display()
+                    "failed to start `{} {} {address}`",
+                    assets.bluealsa_aplay.display(),
+                    PLAYER_VOLUME_MODE
                 )
             });
 
@@ -341,6 +343,10 @@ impl PlayerSupervisor {
     }
 }
 
+fn player_args(address: &str) -> [&str; 2] {
+    [PLAYER_VOLUME_MODE, address]
+}
+
 #[cfg(test)]
 fn find_binary_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
     env::split_paths(path)
@@ -375,7 +381,10 @@ mod tests {
     use orators_core::PlayerState;
     use tempfile::tempdir;
 
-    use super::{BluealsaAssets, PLAYER_MAX_RESTARTS, PlayerSupervisor, find_binary_in_path};
+    use super::{
+        BluealsaAssets, PLAYER_MAX_RESTARTS, PLAYER_VOLUME_MODE, PlayerSupervisor,
+        find_binary_in_path, player_args,
+    };
 
     #[test]
     fn finds_executable_in_path() {
@@ -451,5 +460,13 @@ mod tests {
 
         assert_eq!(supervisor.restart_attempts, PLAYER_MAX_RESTARTS);
         assert!(supervisor.next_restart_at.is_some());
+    }
+
+    #[test]
+    fn player_launch_forces_software_volume_mode() {
+        assert_eq!(
+            player_args("AA:BB:CC:DD:EE:FF"),
+            [PLAYER_VOLUME_MODE, "AA:BB:CC:DD:EE:FF"]
+        );
     }
 }
