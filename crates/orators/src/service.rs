@@ -285,9 +285,11 @@ impl<R: PlatformRuntime> OratorsService<R> {
 
     pub async fn set_device_alias(&self, address: &str, alias: &str) -> Result<String> {
         self.update_config(|config| {
-            if !config.set_device_alias(address, alias) {
+            let alias = alias.trim();
+            if alias.is_empty() {
                 anyhow::bail!("device alias must not be empty");
             }
+            config.set_device_alias(address, alias);
             Ok(())
         })
         .await?;
@@ -703,6 +705,21 @@ mod tests {
         let config_path = temp_config_path();
         let service = OratorsService::new(runtime, OratorsConfig::default(), config_path.clone());
 
+        let status = service.set_device_alias("AA", "Living Room").await.unwrap();
+        let status: orators_core::RuntimeStatus = serde_json::from_str(&status).unwrap();
+
+        assert_eq!(status.devices[0].alias.as_deref(), Some("Living Room"));
+        let saved = OratorsConfig::load_or_default(&config_path).unwrap();
+        assert_eq!(saved.device_alias("AA"), Some("Living Room"));
+    }
+
+    #[tokio::test]
+    async fn alias_updates_are_idempotent() {
+        let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
+        let config_path = temp_config_path();
+        let service = OratorsService::new(runtime, OratorsConfig::default(), config_path.clone());
+
+        service.set_device_alias("AA", "Living Room").await.unwrap();
         let status = service.set_device_alias("AA", "Living Room").await.unwrap();
         let status: orators_core::RuntimeStatus = serde_json::from_str(&status).unwrap();
 

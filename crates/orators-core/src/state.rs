@@ -171,11 +171,19 @@ impl OratorsState {
     }
 
     pub fn update_config(&mut self, config: OratorsConfig) {
+        let previous_config = self.config.clone();
         self.config = config;
         for device in self.devices.values_mut() {
             device.auto_reconnect = self.config.auto_reconnect && device.trusted;
-            if let Some(alias) = self.config.device_alias(&device.address) {
-                device.alias = Some(alias.to_string());
+            let previous_alias = previous_config.device_alias(&device.address);
+            match self.config.device_alias(&device.address) {
+                Some(alias) => device.alias = Some(alias.to_string()),
+                None if previous_alias
+                    .is_some_and(|alias| device.alias.as_deref() == Some(alias)) =>
+                {
+                    device.alias = None;
+                }
+                None => {}
             }
         }
     }
@@ -286,5 +294,18 @@ mod tests {
             status.devices[0].alias.as_deref(),
             Some("Living Room Phone")
         );
+    }
+
+    #[test]
+    fn clearing_local_alias_removes_in_memory_override() {
+        let mut config = OratorsConfig::default();
+        config.set_device_alias("AA", "Living Room Phone");
+        let mut state = OratorsState::new(config);
+        state.sync_devices(vec![sample_device("AA")]);
+
+        state.update_config(OratorsConfig::default());
+
+        let status = state.status(10);
+        assert_eq!(status.devices[0].alias, None);
     }
 }
