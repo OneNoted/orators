@@ -89,7 +89,7 @@ pub async fn run() -> Result<()> {
     .await;
     if let Err(exit_error) = exit_terminal(&mut terminal) {
         return match result {
-            Ok(()) => Err(exit_error.into()),
+            Ok(()) => Err(exit_error),
             Err(run_error) => Err(run_error.context(format!(
                 "failed to restore terminal after TUI error: {exit_error}"
             ))),
@@ -489,7 +489,7 @@ impl App {
             }
             KeyCode::Char('c') => {
                 if device.connected {
-                    client.disconnect_active().await?;
+                    client.disconnect_device(&device.address).await?;
                     self.push_message(format!("Disconnected {}.", device.address));
                 } else {
                     client.connect_device(&device.address).await?;
@@ -498,8 +498,8 @@ impl App {
                 self.refresh().await;
             }
             KeyCode::Char('x') => {
-                if is_active_device(self.status.as_ref(), &device.address) {
-                    let _ = client.disconnect_active().await;
+                if device.connected {
+                    client.disconnect_device(&device.address).await?;
                 }
                 client.forget_device(&device.address).await?;
                 self.push_message(format!("Reset {} on the host.", device.address));
@@ -1027,10 +1027,6 @@ where
     result
 }
 
-fn is_active_device(status: Option<&RuntimeStatus>, address: &str) -> bool {
-    status.and_then(|status| status.active_device.as_deref()) == Some(address)
-}
-
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1069,42 +1065,5 @@ fn severity_label(severity: &Severity) -> &'static str {
         Severity::Info => "info",
         Severity::Warn => "warn",
         Severity::Error => "error",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_active_device;
-    use orators_core::{
-        AudioDefaults, DeviceInfo, MediaBackendStatus, PairingWindow, RuntimeStatus,
-    };
-
-    fn sample_status(active_device: Option<&str>) -> RuntimeStatus {
-        RuntimeStatus {
-            pairing: PairingWindow {
-                enabled: false,
-                timeout_secs: 60,
-                expires_at_epoch_secs: None,
-            },
-            active_device: active_device.map(str::to_string),
-            devices: vec![DeviceInfo {
-                address: "AA".to_string(),
-                alias: Some("Phone".to_string()),
-                trusted: true,
-                paired: true,
-                connected: active_device == Some("AA"),
-                active_profile: None,
-                auto_reconnect: true,
-            }],
-            audio: AudioDefaults::default(),
-            backend: MediaBackendStatus::default(),
-        }
-    }
-
-    #[test]
-    fn reset_only_disconnects_selected_active_device() {
-        assert!(!is_active_device(Some(&sample_status(Some("BB"))), "AA"));
-        assert!(is_active_device(Some(&sample_status(Some("AA"))), "AA"));
-        assert!(!is_active_device(Some(&sample_status(None)), "AA"));
     }
 }

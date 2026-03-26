@@ -226,6 +226,13 @@ impl<R: PlatformRuntime> OratorsService<R> {
         serialize(&status)
     }
 
+    pub async fn disconnect_device(&self, address: &str) -> Result<String> {
+        self.refresh_status().await?;
+        self.runtime.disconnect_device(address).await?;
+        let status = self.refresh_status().await?;
+        serialize(&status)
+    }
+
     pub async fn diagnostics_json(&self) -> Result<String> {
         let report = self.runtime.diagnostics().await?;
         serialize(&report)
@@ -239,7 +246,10 @@ impl<R: PlatformRuntime> OratorsService<R> {
             Ok(())
         })
         .await?;
-        self.status_json().await
+        let now = now_epoch_secs();
+        let mut state = self.state.lock().await;
+        state.trust_device(address)?;
+        serialize(&state.status(now))
     }
 
     pub async fn disallow_device(&self, address: &str) -> Result<String> {
@@ -250,7 +260,10 @@ impl<R: PlatformRuntime> OratorsService<R> {
             Ok(())
         })
         .await?;
-        self.status_json().await
+        let now = now_epoch_secs();
+        let mut state = self.state.lock().await;
+        state.untrust_device(address)?;
+        serialize(&state.status(now))
     }
 
     pub async fn set_pairing_timeout(&self, timeout_secs: u64) -> Result<String> {
@@ -364,9 +377,13 @@ impl<R: PlatformRuntime> OratorsService<R> {
             tracing::warn!(?error, "failed to reconcile BlueALSA playback runtime");
         }
         let audio = self.runtime.current_audio_defaults().await?;
-        let backend = self.runtime.backend_status().await?;
-        self.clear_stale_adapter_override_if_needed(&backend)
-            .await?;
+        let mut backend = self.runtime.backend_status().await?;
+        if self
+            .clear_stale_adapter_override_if_needed(&backend)
+            .await?
+        {
+            backend.configured_adapter = None;
+        }
         let now = now_epoch_secs();
         let mut state = self.state.lock().await;
         state.sync_devices(devices);
@@ -402,9 +419,9 @@ impl<R: PlatformRuntime> OratorsService<R> {
     async fn clear_stale_adapter_override_if_needed(
         &self,
         backend: &MediaBackendStatus,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if backend.adapter_mode != AdapterMode::Auto || backend.resolved_adapter.is_none() {
-            return Ok(());
+            return Ok(false);
         }
 
         let Some(mut config) = ({
@@ -415,13 +432,13 @@ impl<R: PlatformRuntime> OratorsService<R> {
                 None
             }
         }) else {
-            return Ok(());
+            return Ok(false);
         };
 
         config.adapter = None;
         config.save(&self.config_path)?;
         self.state.lock().await.update_config(config);
-        Ok(())
+        Ok(true)
     }
 
     async fn update_config<F>(&self, mutator: F) -> Result<OratorsConfig>
@@ -543,6 +560,16 @@ mod tests {
 
         async fn disconnect_device(&self, address: &str) -> Result<()> {
             self.disconnects.lock().await.push(address.to_string());
+            if let Some(device) = self
+                .devices
+                .lock()
+                .await
+                .iter_mut()
+                .find(|device| device.address == address)
+            {
+                device.connected = false;
+                device.active_profile = None;
+            }
             Ok(())
         }
 
@@ -646,6 +673,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_device_uses_requested_runtime_address() {
+        let runtime = Arc::new(MockRuntime::new(vec![
+            DeviceInfo {
+                connected: true,
+                trusted: true,
+                auto_reconnect: true,
+                ..sample_device("AA")
+            },
+            DeviceInfo {
+                connected: true,
+                trusted: true,
+                auto_reconnect: true,
+                ..sample_device("BB")
+            },
+        ]));
+        let service = OratorsService::new(
+            runtime.clone(),
+            OratorsConfig::default(),
+            temp_config_path(),
+        );
+
+        let status = service.disconnect_device("BB").await.unwrap();
+        let status: orators_core::RuntimeStatus = serde_json::from_str(&status).unwrap();
+
+        assert_eq!(runtime.disconnects.lock().await.as_slice(), ["BB"]);
+        assert_eq!(status.active_device.as_deref(), Some("AA"));
+        assert!(
+            !status
+                .devices
+                .iter()
+                .any(|device| device.address == "BB" && device.connected)
+        );
+    }
+
+    #[tokio::test]
     async fn expiring_pairing_keeps_active_device_connected() {
         let runtime = Arc::new(MockRuntime::new(vec![sample_device("AA")]));
         let service = OratorsService::new(
@@ -677,6 +739,22 @@ mod tests {
 
         assert!(status.devices[0].trusted);
         assert!(status.devices[0].auto_reconnect);
+    }
+
+    #[tokio::test]
+    async fn disabling_auto_reconnect_overrides_stale_runtime_snapshots() {
+        let runtime = Arc::new(MockRuntime::new(vec![DeviceInfo {
+            trusted: true,
+            auto_reconnect: true,
+            ..sample_device("AA")
+        }]));
+        let service = OratorsService::new(runtime, OratorsConfig::default(), temp_config_path());
+
+        service.set_auto_reconnect(false).await.unwrap();
+        let status = service.status_json().await.unwrap();
+        let status: orators_core::RuntimeStatus = serde_json::from_str(&status).unwrap();
+
+        assert!(!status.devices[0].auto_reconnect);
     }
 
     #[tokio::test]

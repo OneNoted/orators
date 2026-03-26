@@ -132,7 +132,10 @@ trait DeviceResetClient {
         address: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
     fn status<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
-    fn disconnect_active<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+    fn disconnect_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
     fn forget_device<'a>(
         &'a self,
         address: &'a str,
@@ -151,8 +154,11 @@ impl DeviceResetClient for ControllerClient {
         Box::pin(async move { ControllerClient::status(self).await })
     }
 
-    fn disconnect_active<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
-        Box::pin(async move { ControllerClient::disconnect_active(self).await })
+    fn disconnect_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move { ControllerClient::disconnect_device(self, address).await })
     }
 
     fn forget_device<'a>(
@@ -323,8 +329,12 @@ async fn reset_device<C: DeviceResetClient + ?Sized>(
         client.status().await?
     };
     let status: RuntimeStatus = serde_json::from_str(&status)?;
-    if status.active_device.as_deref() == Some(mac) {
-        let _ = client.disconnect_active().await;
+    if status
+        .devices
+        .iter()
+        .any(|device| device.address == mac && device.connected)
+    {
+        client.disconnect_device(mac).await?;
     }
     client.forget_device(mac).await
 }
@@ -672,7 +682,7 @@ mod tests {
     use std::{future::Future, pin::Pin, sync::Mutex};
 
     use anyhow::anyhow;
-    use orators_core::{AudioDefaults, MediaBackendStatus, PairingWindow};
+    use orators_core::{AudioDefaults, DeviceInfo, MediaBackendStatus, PairingWindow};
 
     use super::{DeviceResetClient, RuntimeStatus, reset_device};
 
@@ -710,15 +720,20 @@ mod tests {
             })
         }
 
-        fn disconnect_active<'a>(
+        fn disconnect_device<'a>(
             &'a self,
+            address: &'a str,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
             let result = self
                 .disconnect_result
                 .clone()
                 .map_err(|error| anyhow!(error));
+            let address = address.to_string();
             Box::pin(async move {
-                self.calls.lock().unwrap().push("disconnect".to_string());
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("disconnect:{address}"));
                 result
             })
         }
@@ -744,7 +759,15 @@ mod tests {
                 expires_at_epoch_secs: None,
             },
             active_device: active_device.map(str::to_string),
-            devices: vec![],
+            devices: vec![DeviceInfo {
+                address: "AA".to_string(),
+                alias: Some("Phone".to_string()),
+                trusted: true,
+                paired: true,
+                connected: active_device == Some("AA"),
+                active_profile: None,
+                auto_reconnect: true,
+            }],
             audio: AudioDefaults::default(),
             backend: MediaBackendStatus::default(),
         })
@@ -783,7 +806,7 @@ mod tests {
         assert!(status.active_device.is_none());
         assert_eq!(
             client.calls.lock().unwrap().as_slice(),
-            ["disallow:AA", "disconnect", "forget:AA"]
+            ["disallow:AA", "disconnect:AA", "forget:AA"]
         );
     }
 }

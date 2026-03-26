@@ -241,6 +241,27 @@ impl DbusApi {
         Ok(status)
     }
 
+    #[zbus(name = "DisconnectDevice")]
+    async fn disconnect_device(
+        &self,
+        address: &str,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+    ) -> fdo::Result<String> {
+        let status = self
+            .service
+            .disconnect_device(address)
+            .await
+            .map_err(to_fdo)?;
+        let active = self.service.active_device().await.unwrap_or_default();
+        Self::active_device_changed(&ctxt, &active)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Self::status_changed(&ctxt, &status)
+            .await
+            .map_err(to_fdo_zbus)?;
+        Ok(status)
+    }
+
     #[zbus(name = "GetDiagnostics")]
     async fn get_diagnostics(&self) -> fdo::Result<String> {
         self.service.diagnostics_json().await.map_err(to_fdo)

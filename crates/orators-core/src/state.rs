@@ -46,9 +46,7 @@ impl OratorsState {
                     }
                 }
 
-                if self.config.auto_reconnect && device.trusted {
-                    device.auto_reconnect = true;
-                }
+                device.auto_reconnect = self.config.auto_reconnect && device.trusted;
 
                 if let Some(alias) = self.config.device_alias(&device.address) {
                     device.alias = Some(alias.to_string());
@@ -307,5 +305,22 @@ mod tests {
 
         let status = state.status(10);
         assert_eq!(status.devices[0].alias, None);
+    }
+
+    #[test]
+    fn sync_devices_overrides_stale_auto_reconnect_snapshot() {
+        let config = OratorsConfig {
+            auto_reconnect: false,
+            ..OratorsConfig::default()
+        };
+        let mut state = OratorsState::new(config);
+        let mut device = sample_device("AA");
+        device.trusted = true;
+        device.auto_reconnect = true;
+
+        state.sync_devices(vec![device]);
+
+        let status = state.status(10);
+        assert!(!status.devices[0].auto_reconnect);
     }
 }

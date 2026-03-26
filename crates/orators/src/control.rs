@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use orators_core::{OratorsConfig, dbus};
+use orators_core::{OratorsConfig, RuntimeStatus, dbus};
 use orators_linux::{
     LinuxPlatform,
     systemd::{SystemBackendAdapterMode, SystemBackendInstallResult, SystemdUserRuntime},
@@ -132,6 +132,30 @@ impl ControllerClient {
             .call("ConnectDevice", &(address,))
             .await
             .map_err(|error| explain_dbus_error("connect device", error))
+    }
+
+    pub async fn disconnect_device(&self, address: &str) -> Result<String> {
+        let proxy = self.proxy().await?;
+        match proxy.call("DisconnectDevice", &(address,)).await {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                let error = explain_dbus_error("disconnect device", error);
+                if !is_unknown_method_error(&error, "DisconnectDevice") {
+                    return Err(error);
+                }
+
+                let status = self.status().await?;
+                let status: RuntimeStatus = serde_json::from_str(&status)
+                    .context("failed to decode daemon status during disconnect fallback")?;
+                if status.active_device.as_deref() == Some(address) {
+                    return self.disconnect_active().await;
+                }
+
+                anyhow::bail!(
+                    "disconnect device failed: the running daemon does not support selecting a non-active connected device yet\nNext step: restart oratorsd from this build, or disconnect the active device first."
+                );
+            }
+        }
     }
 
     pub async fn disconnect_active(&self) -> Result<String> {
