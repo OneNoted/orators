@@ -230,12 +230,17 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
         },
         Command::Config(args) => match args.command {
             ConfigCommand::Show => {
-                let output = client.get_config().await?;
+                let config = client.get_config_or_local().await?;
                 if json {
-                    print_jsonish(&output)?;
+                    print_jsonish(&config.json)?;
                 } else {
-                    let config: OratorsConfig = serde_json::from_str(&output)?;
-                    render_config(&config);
+                    let config_value: OratorsConfig = serde_json::from_str(&config.json)?;
+                    if !config.daemon_backed {
+                        println!(
+                            "Daemon does not expose GetConfig yet; showing the local config file instead."
+                        );
+                    }
+                    render_config(&config_value);
                 }
             }
             ConfigCommand::Set { setting } => {

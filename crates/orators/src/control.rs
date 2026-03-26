@@ -13,6 +13,11 @@ pub struct ControllerClient {
     connection: Connection,
 }
 
+pub struct ConfigFetch {
+    pub json: String,
+    pub daemon_backed: bool,
+}
+
 impl ControllerClient {
     pub async fn connect() -> Result<Self> {
         let connection = Connection::session()
@@ -60,6 +65,24 @@ impl ControllerClient {
             .call("GetConfig", &())
             .await
             .map_err(|error| explain_dbus_error("get config", error))
+    }
+
+    pub async fn get_config_or_local(&self) -> Result<ConfigFetch> {
+        match self.get_config().await {
+            Ok(json) => Ok(ConfigFetch {
+                json,
+                daemon_backed: true,
+            }),
+            Err(error) if is_unknown_method_error(&error, "GetConfig") => {
+                let (_, config) = load_local_config()?;
+                Ok(ConfigFetch {
+                    json: serde_json::to_string(&config)
+                        .context("failed to serialize local config fallback")?,
+                    daemon_backed: false,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn trust_device(&self, address: &str) -> Result<String> {
@@ -293,4 +316,10 @@ fn explain_dbus_error(action: &str, error: zbus::Error) -> anyhow::Error {
     };
 
     anyhow!("{action} failed: {detail}\nNext step: {next_step}")
+}
+
+fn is_unknown_method_error(error: &anyhow::Error, method: &str) -> bool {
+    let detail = error.to_string();
+    detail.contains("org.freedesktop.DBus.Error.UnknownMethod")
+        && detail.contains(&format!("'{method}'"))
 }

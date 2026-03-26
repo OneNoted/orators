@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -127,7 +127,15 @@ impl App {
     }
 
     fn push_message(&mut self, message: impl Into<String>) {
-        self.messages.push(message.into());
+        let message = message.into();
+        if self
+            .messages
+            .last()
+            .is_some_and(|existing| existing == &message)
+        {
+            return;
+        }
+        self.messages.push(message);
         if self.messages.len() > 20 {
             let drop_count = self.messages.len() - 20;
             self.messages.drain(0..drop_count);
@@ -170,25 +178,15 @@ impl App {
         }
 
         match ControllerClient::connect().await {
-            Ok(client) => {
-                match (
-                    client.status().await,
-                    client.get_diagnostics().await,
-                    client.get_config().await,
-                ) {
-                    (Ok(status), Ok(diagnostics), Ok(config)) => {
-                        self.status = serde_json::from_str(&status).ok();
-                        self.diagnostics = serde_json::from_str(&diagnostics).ok();
-                        if let Ok(config) = serde_json::from_str(&config) {
-                            self.config = config;
-                        }
-                        self.connection_error = None;
-                    }
-                    _ => {
-                        self.connection_error = Some("Failed to refresh daemon status".to_string());
-                    }
+            Ok(client) => match self.refresh_from_client(&client).await {
+                Ok(()) => {
+                    self.connection_error = None;
                 }
-            }
+                Err(error) => {
+                    self.connection_error =
+                        Some(format!("Failed to refresh daemon status: {error}"));
+                }
+            },
             Err(error) => {
                 self.connection_error = Some(error.to_string());
                 self.status = None;
@@ -204,6 +202,31 @@ impl App {
         } else {
             self.selected_device = 0;
         }
+    }
+
+    async fn refresh_from_client(&mut self, client: &ControllerClient) -> Result<()> {
+        let status_json = client.status().await?;
+        let diagnostics_json = client.get_diagnostics().await?;
+        let config = client.get_config_or_local().await?;
+
+        let status: RuntimeStatus =
+            serde_json::from_str(&status_json).context("failed to decode daemon status payload")?;
+        let diagnostics: DiagnosticsReport = serde_json::from_str(&diagnostics_json)
+            .context("failed to decode daemon diagnostics payload")?;
+        let config_value: OratorsConfig =
+            serde_json::from_str(&config.json).context("failed to decode daemon config payload")?;
+
+        self.status = Some(status);
+        self.diagnostics = Some(diagnostics);
+        self.config = config_value;
+
+        if !config.daemon_backed {
+            self.push_message(
+                "Running daemon does not expose GetConfig yet; using local config fallback.",
+            );
+        }
+
+        Ok(())
     }
 
     async fn handle_key(&mut self, terminal: &mut TuiTerminal, key: KeyEvent) -> Result<()> {
