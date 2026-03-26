@@ -378,11 +378,12 @@ impl<R: PlatformRuntime> OratorsService<R> {
         }
         let audio = self.runtime.current_audio_defaults().await?;
         let mut backend = self.runtime.backend_status().await?;
-        if self
-            .clear_stale_adapter_override_if_needed(&backend)
-            .await?
-        {
-            backend.configured_adapter = None;
+        match self.clear_stale_adapter_override_if_needed(&backend).await {
+            Ok(true) => backend.configured_adapter = None,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(?error, "failed to clear stale Bluetooth adapter override");
+            }
         }
         let now = now_epoch_secs();
         let mut state = self.state.lock().await;
@@ -466,14 +467,14 @@ pub fn now_epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, path::PathBuf, sync::Arc};
+    use std::{fs, path::Path, path::PathBuf, sync::Arc};
 
     use super::{OratorsService, PlatformRuntime};
     use anyhow::Result;
     use async_trait::async_trait;
     use orators_core::{
-        AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport, MediaBackendStatus,
-        OratorsConfig, Severity,
+        AdapterMode, AudioDefaults, DeviceInfo, DiagnosticCheck, DiagnosticsReport,
+        MediaBackendStatus, OratorsConfig, Severity,
     };
     use tempfile::tempdir;
 
@@ -481,6 +482,7 @@ mod tests {
         devices: tokio::sync::Mutex<Vec<DeviceInfo>>,
         disconnects: tokio::sync::Mutex<Vec<String>>,
         connects: tokio::sync::Mutex<Vec<String>>,
+        backend_status: tokio::sync::Mutex<Option<MediaBackendStatus>>,
         stop_pairing_calls: tokio::sync::Mutex<usize>,
     }
 
@@ -490,6 +492,20 @@ mod tests {
                 devices: tokio::sync::Mutex::new(devices),
                 disconnects: tokio::sync::Mutex::new(Vec::new()),
                 connects: tokio::sync::Mutex::new(Vec::new()),
+                backend_status: tokio::sync::Mutex::new(None),
+                stop_pairing_calls: tokio::sync::Mutex::new(0),
+            }
+        }
+
+        fn with_backend_status(
+            devices: Vec<DeviceInfo>,
+            backend_status: MediaBackendStatus,
+        ) -> Self {
+            Self {
+                devices: tokio::sync::Mutex::new(devices),
+                disconnects: tokio::sync::Mutex::new(Vec::new()),
+                connects: tokio::sync::Mutex::new(Vec::new()),
+                backend_status: tokio::sync::Mutex::new(Some(backend_status)),
                 stop_pairing_calls: tokio::sync::Mutex::new(0),
             }
         }
@@ -582,6 +598,9 @@ mod tests {
         }
 
         async fn backend_status(&self) -> Result<MediaBackendStatus> {
+            if let Some(status) = self.backend_status.lock().await.clone() {
+                return Ok(status);
+            }
             let active = self
                 .devices
                 .lock()
@@ -804,5 +823,35 @@ mod tests {
         assert_eq!(status.devices[0].alias.as_deref(), Some("Living Room"));
         let saved = OratorsConfig::load_or_default(&config_path).unwrap();
         assert_eq!(saved.device_alias("AA"), Some("Living Room"));
+    }
+
+    #[tokio::test]
+    async fn stale_adapter_cleanup_failure_does_not_break_status_refresh() {
+        let runtime = Arc::new(MockRuntime::with_backend_status(
+            vec![sample_device("AA")],
+            MediaBackendStatus {
+                installed: true,
+                system_service_ready: true,
+                adapter_mode: AdapterMode::Auto,
+                resolved_adapter: Some("hci0".to_string()),
+                configured_adapter: Some("hci9".to_string()),
+                ..MediaBackendStatus::default()
+            },
+        ));
+        let config = OratorsConfig {
+            adapter: Some("hci9".to_string()),
+            ..OratorsConfig::default()
+        };
+        let temp = tempdir().unwrap();
+        let blocked_parent = temp.path().join("not-a-directory");
+        fs::write(&blocked_parent, "x").unwrap();
+        let config_path = blocked_parent.join("orators-config.toml");
+        let service = OratorsService::new(runtime, config, config_path);
+
+        let status = service.status_json().await.unwrap();
+        let status: orators_core::RuntimeStatus = serde_json::from_str(&status).unwrap();
+
+        assert_eq!(status.backend.configured_adapter.as_deref(), Some("hci9"));
+        assert_eq!(status.backend.resolved_adapter.as_deref(), Some("hci0"));
     }
 }
