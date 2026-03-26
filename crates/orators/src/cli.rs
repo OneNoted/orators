@@ -1,3 +1,5 @@
+use std::{future::Future, pin::Pin};
+
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use orators_core::{
@@ -124,6 +126,43 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+trait DeviceResetClient {
+    fn disallow_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+    fn status<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+    fn disconnect_active<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+    fn forget_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>>;
+}
+
+impl DeviceResetClient for ControllerClient {
+    fn disallow_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move { ControllerClient::disallow_device(self, address).await })
+    }
+
+    fn status<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move { ControllerClient::status(self).await })
+    }
+
+    fn disconnect_active<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move { ControllerClient::disconnect_active(self).await })
+    }
+
+    fn forget_device<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move { ControllerClient::forget_device(self, address).await })
+    }
+}
+
 async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
     let client = ControllerClient::connect().await?;
     match command {
@@ -193,15 +232,7 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
                 drop_allowlist,
             } => {
                 let mac = normalize_device_address(&mac);
-                if drop_allowlist {
-                    let _ = client.disallow_device(&mac).await;
-                }
-                let status = client.status().await?;
-                let status: RuntimeStatus = serde_json::from_str(&status)?;
-                if status.active_device.as_deref() == Some(mac.as_str()) {
-                    let _ = client.disconnect_active().await;
-                }
-                let output = client.forget_device(&mac).await?;
+                let output = reset_device(&client, &mac, drop_allowlist).await?;
                 if json {
                     print_jsonish(&output)?;
                 } else {
@@ -279,6 +310,23 @@ async fn run_daemon_command(command: Command, json: bool) -> Result<()> {
         | Command::UninstallSystemBackend => unreachable!(),
     }
     Ok(())
+}
+
+async fn reset_device<C: DeviceResetClient + ?Sized>(
+    client: &C,
+    mac: &str,
+    drop_allowlist: bool,
+) -> Result<String> {
+    let status = if drop_allowlist {
+        client.disallow_device(mac).await?
+    } else {
+        client.status().await?
+    };
+    let status: RuntimeStatus = serde_json::from_str(&status)?;
+    if status.active_device.as_deref() == Some(mac) {
+        let _ = client.disconnect_active().await;
+    }
+    client.forget_device(mac).await
 }
 
 async fn run_doctor(json: bool) -> Result<()> {
@@ -616,5 +664,126 @@ fn player_state_label(state: &PlayerState) -> &'static str {
         PlayerState::Starting => "starting",
         PlayerState::Playing => "playing",
         PlayerState::Error => "error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::Future, pin::Pin, sync::Mutex};
+
+    use anyhow::anyhow;
+    use orators_core::{AudioDefaults, MediaBackendStatus, PairingWindow};
+
+    use super::{DeviceResetClient, RuntimeStatus, reset_device};
+
+    type StubResult = std::result::Result<String, &'static str>;
+
+    struct FakeDeviceResetClient {
+        calls: Mutex<Vec<String>>,
+        disallow_result: StubResult,
+        status_result: StubResult,
+        disconnect_result: StubResult,
+        forget_result: StubResult,
+    }
+
+    impl DeviceResetClient for FakeDeviceResetClient {
+        fn disallow_device<'a>(
+            &'a self,
+            address: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
+            let result = self.disallow_result.clone().map_err(|error| anyhow!(error));
+            let address = address.to_string();
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("disallow:{address}"));
+                result
+            })
+        }
+
+        fn status<'a>(&'a self) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
+            let result = self.status_result.clone().map_err(|error| anyhow!(error));
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("status".to_string());
+                result
+            })
+        }
+
+        fn disconnect_active<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
+            let result = self
+                .disconnect_result
+                .clone()
+                .map_err(|error| anyhow!(error));
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("disconnect".to_string());
+                result
+            })
+        }
+
+        fn forget_device<'a>(
+            &'a self,
+            address: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
+            let result = self.forget_result.clone().map_err(|error| anyhow!(error));
+            let address = address.to_string();
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(format!("forget:{address}"));
+                result
+            })
+        }
+    }
+
+    fn status_json(active_device: Option<&str>) -> String {
+        serde_json::to_string(&RuntimeStatus {
+            pairing: PairingWindow {
+                enabled: false,
+                timeout_secs: 60,
+                expires_at_epoch_secs: None,
+            },
+            active_device: active_device.map(str::to_string),
+            devices: vec![],
+            audio: AudioDefaults::default(),
+            backend: MediaBackendStatus::default(),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reset_with_drop_allowlist_propagates_disallow_errors() {
+        let client = FakeDeviceResetClient {
+            calls: Mutex::new(vec![]),
+            disallow_result: Err("disallow failed"),
+            status_result: Ok(status_json(Some("AA"))),
+            disconnect_result: Ok(status_json(None)),
+            forget_result: Ok(status_json(None)),
+        };
+
+        let error = reset_device(&client, "AA", true).await.unwrap_err();
+
+        assert!(error.to_string().contains("disallow failed"));
+        assert_eq!(client.calls.lock().unwrap().as_slice(), ["disallow:AA"]);
+    }
+
+    #[tokio::test]
+    async fn reset_with_drop_allowlist_uses_disallow_status_and_forgets_device() {
+        let client = FakeDeviceResetClient {
+            calls: Mutex::new(vec![]),
+            disallow_result: Ok(status_json(Some("AA"))),
+            status_result: Ok(status_json(Some("AA"))),
+            disconnect_result: Ok(status_json(None)),
+            forget_result: Ok(status_json(None)),
+        };
+
+        let output = reset_device(&client, "AA", true).await.unwrap();
+        let status: RuntimeStatus = serde_json::from_str(&output).unwrap();
+
+        assert!(status.active_device.is_none());
+        assert_eq!(
+            client.calls.lock().unwrap().as_slice(),
+            ["disallow:AA", "disconnect", "forget:AA"]
+        );
     }
 }

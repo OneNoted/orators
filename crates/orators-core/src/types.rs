@@ -37,6 +37,7 @@ pub struct MediaBackendStatus {
     pub backend: MediaBackendKind,
     pub installed: bool,
     pub system_service_ready: bool,
+    #[serde(default)]
     pub adapter_mode: AdapterMode,
     pub resolved_adapter: Option<String>,
     pub configured_adapter: Option<String>,
@@ -95,4 +96,43 @@ pub struct RuntimeStatus {
     pub devices: Vec<DeviceInfo>,
     pub audio: AudioDefaults,
     pub backend: MediaBackendStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AdapterMode, RuntimeStatus};
+
+    #[test]
+    fn runtime_status_accepts_missing_backend_adapter_mode() {
+        let payload = r#"{
+            "pairing": {
+                "enabled": false,
+                "timeout_secs": 60,
+                "expires_at_epoch_secs": null
+            },
+            "active_device": null,
+            "devices": [],
+            "audio": {
+                "output_device": null,
+                "input_device": null,
+                "local_output_available": false
+            },
+            "backend": {
+                "backend": "bluealsa",
+                "installed": true,
+                "system_service_ready": true,
+                "resolved_adapter": "hci0",
+                "configured_adapter": null,
+                "player_state": "waiting",
+                "player_running": false,
+                "active_device_address": null,
+                "last_error": null
+            }
+        }"#;
+
+        let status: RuntimeStatus = serde_json::from_str(payload).unwrap();
+
+        assert_eq!(status.backend.adapter_mode, AdapterMode::Auto);
+        assert_eq!(status.backend.resolved_adapter.as_deref(), Some("hci0"));
+    }
 }
