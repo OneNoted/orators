@@ -975,7 +975,10 @@ async fn run_app(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
                 continue;
             };
             if key.kind == KeyEventKind::Press {
-                app.handle_key(terminal, key).await?;
+                if let Err(error) = app.handle_key(terminal, key).await {
+                    app.push_message(format!("Error: {error}"));
+                    app.refresh().await;
+                }
             }
         }
 

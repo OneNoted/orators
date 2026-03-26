@@ -79,15 +79,31 @@ impl LinuxPlatform {
             .await
             .with_context(|| format!("failed to initiate Bluetooth connection for {address}"))?;
 
-        self.bluez
+        if self
+            .bluez
             .wait_for_connected(address, std::time::Duration::from_secs(10))
             .await?
-            .then_some(())
-            .context("the phone did not reach a connected Bluetooth state within 10 seconds")
+        {
+            Ok(())
+        } else {
+            let _ = self.bluez.disconnect_device(address).await;
+            anyhow::bail!("the phone did not reach a connected Bluetooth state within 10 seconds")
+        }
     }
 
     pub async fn disconnect_device(&self, address: &str) -> Result<()> {
-        self.bluez.disconnect_device(address).await?;
+        if let Err(error) = self.bluez.disconnect_device(address).await {
+            let still_connected = self
+                .bluez
+                .remote_devices()
+                .await?
+                .into_iter()
+                .find(|device| device.address == address)
+                .is_some_and(|device| device.connected);
+            if still_connected {
+                return Err(error);
+            }
+        }
         self.reconcile_runtime().await
     }
 
