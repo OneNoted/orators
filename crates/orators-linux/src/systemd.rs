@@ -30,12 +30,19 @@ pub struct ServiceStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemBackendAdapterMode {
+    Auto,
+    Explicit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemBackendInstallResult {
     pub user_service_path: PathBuf,
     pub wireplumber_fragment_path: PathBuf,
     pub dbus_policy_path: PathBuf,
     pub system_unit_path: PathBuf,
-    pub adapter: String,
+    pub adapter_mode: SystemBackendAdapterMode,
+    pub resolved_adapter: String,
 }
 
 impl SystemdUserRuntime {
@@ -58,7 +65,8 @@ impl SystemdUserRuntime {
     pub async fn install_system_backend(
         &self,
         assets: &BluealsaAssets,
-        adapter: &str,
+        adapter: Option<&str>,
+        resolved_adapter: &str,
     ) -> Result<SystemBackendInstallResult> {
         self.cleanup_legacy_wireplumber_dropin().await?;
         self.remove_legacy_fragment().await?;
@@ -124,7 +132,12 @@ impl SystemdUserRuntime {
                 wireplumber_fragment_path: fragment_path.clone(),
                 dbus_policy_path: dbus_policy_path.clone(),
                 system_unit_path: system_unit_path.clone(),
-                adapter: adapter.to_string(),
+                adapter_mode: if adapter.is_some() {
+                    SystemBackendAdapterMode::Explicit
+                } else {
+                    SystemBackendAdapterMode::Auto
+                },
+                resolved_adapter: resolved_adapter.to_string(),
             })
         }
         .await;
@@ -414,11 +427,14 @@ pub fn render_user_unit(daemon_path: &Path) -> String {
     )
 }
 
-pub fn render_system_backend_unit(bluealsad_path: &Path, adapter: &str) -> String {
+pub fn render_system_backend_unit(bluealsad_path: &Path, adapter: Option<&str>) -> String {
+    let exec_start = match adapter {
+        Some(adapter) => format!("{} -p a2dp-sink -i {adapter}", bluealsad_path.display()),
+        None => format!("{} -p a2dp-sink", bluealsad_path.display()),
+    };
     format!(
-        "[Unit]\nDescription=Orators BlueALSA backend\nAfter=bluetooth.service\nRequires=bluetooth.service\n\n[Service]\nType=simple\nExecStart={} -p a2dp-sink -i {}\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
-        bluealsad_path.display(),
-        adapter,
+        "[Unit]\nDescription=Orators BlueALSA backend\nAfter=bluetooth.service\nRequires=bluetooth.service\n\n[Service]\nType=simple\nExecStart={}\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
+        exec_start,
     )
 }
 
@@ -459,9 +475,16 @@ mod tests {
 
     #[test]
     fn renders_system_backend_unit() {
-        let unit = render_system_backend_unit(Path::new("/usr/bin/bluealsad"), "hci1");
+        let unit = render_system_backend_unit(Path::new("/usr/bin/bluealsad"), Some("hci1"));
         assert!(unit.contains("ExecStart=/usr/bin/bluealsad -p a2dp-sink -i hci1"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn renders_system_backend_unit_in_auto_mode() {
+        let unit = render_system_backend_unit(Path::new("/usr/bin/bluealsad"), None);
+        assert!(unit.contains("ExecStart=/usr/bin/bluealsad -p a2dp-sink"));
+        assert!(!unit.contains(" -i "));
     }
 
     #[test]

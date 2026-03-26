@@ -10,7 +10,9 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use orators_core::{DeviceInfo, DiagnosticsReport, OratorsConfig, RuntimeStatus, Severity};
+use orators_core::{
+    AdapterMode, DeviceInfo, DiagnosticsReport, OratorsConfig, RuntimeStatus, Severity,
+};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -68,6 +70,14 @@ enum InputMode {
     EditAlias { address: String, value: String },
     EditPairingTimeout { value: String },
     EditAdapter { value: String },
+}
+
+#[derive(Clone, Copy)]
+enum SettingItem {
+    PairingTimeout,
+    AutoReconnect,
+    SingleActiveDevice,
+    Adapter,
 }
 
 pub async fn run() -> Result<()> {
@@ -148,28 +158,44 @@ impl App {
             .and_then(|status| status.devices.get(self.selected_device))
     }
 
-    fn settings_items(&self) -> Vec<(String, String)> {
-        vec![
+    fn settings_items(&self) -> Vec<(SettingItem, String, String)> {
+        let mut items = vec![
             (
+                SettingItem::PairingTimeout,
                 "Pairing timeout".to_string(),
                 format!("{}s", self.config.pairing_timeout_secs),
             ),
             (
+                SettingItem::AutoReconnect,
                 "Auto reconnect".to_string(),
                 yes_no(self.config.auto_reconnect).to_string(),
             ),
             (
+                SettingItem::SingleActiveDevice,
                 "Single active device".to_string(),
                 yes_no(self.config.single_active_device).to_string(),
             ),
-            (
+        ];
+
+        if self.adapter_setting_visible() {
+            items.push((
+                SettingItem::Adapter,
                 "Adapter".to_string(),
                 self.config
                     .adapter
                     .clone()
                     .unwrap_or_else(|| "auto".to_string()),
-            ),
-        ]
+            ));
+        }
+
+        items
+    }
+
+    fn adapter_setting_visible(&self) -> bool {
+        !self.status.as_ref().is_some_and(|status| {
+            status.backend.adapter_mode == AdapterMode::Auto
+                && status.backend.resolved_adapter.is_some()
+        })
     }
 
     async fn refresh(&mut self) {
@@ -493,14 +519,17 @@ impl App {
         if items.is_empty() {
             return Ok(());
         }
+        if self.selected_setting >= items.len() {
+            self.selected_setting = items.len() - 1;
+        }
 
-        match (self.selected_setting, key.code) {
-            (0, KeyCode::Enter) => {
+        match (items[self.selected_setting].0, key.code) {
+            (SettingItem::PairingTimeout, KeyCode::Enter) => {
                 self.input_mode = InputMode::EditPairingTimeout {
                     value: self.config.pairing_timeout_secs.to_string(),
                 };
             }
-            (1, KeyCode::Enter | KeyCode::Char(' ')) => {
+            (SettingItem::AutoReconnect, KeyCode::Enter | KeyCode::Char(' ')) => {
                 let client = ControllerClient::connect().await?;
                 client
                     .set_auto_reconnect(!self.config.auto_reconnect)
@@ -508,7 +537,7 @@ impl App {
                 self.push_message("Auto reconnect updated.");
                 self.refresh().await;
             }
-            (2, KeyCode::Enter | KeyCode::Char(' ')) => {
+            (SettingItem::SingleActiveDevice, KeyCode::Enter | KeyCode::Char(' ')) => {
                 let client = ControllerClient::connect().await?;
                 client
                     .set_single_active_device(!self.config.single_active_device)
@@ -516,7 +545,7 @@ impl App {
                 self.push_message("Single active device setting updated.");
                 self.refresh().await;
             }
-            (3, KeyCode::Enter) => {
+            (SettingItem::Adapter, KeyCode::Enter) => {
                 self.input_mode = InputMode::EditAdapter {
                     value: self.config.adapter.clone().unwrap_or_default(),
                 };
@@ -565,9 +594,13 @@ impl App {
             .await;
         match result {
             Ok((_, install)) => {
+                let mode = match install.adapter_mode {
+                    orators_linux::systemd::SystemBackendAdapterMode::Auto => "auto",
+                    orators_linux::systemd::SystemBackendAdapterMode::Explicit => "explicit",
+                };
                 self.push_message(format!(
-                    "Installed backend for adapter {}.",
-                    install.adapter
+                    "Installed backend in {mode} mode on {}.",
+                    install.resolved_adapter
                 ));
             }
             Err(error) => self.push_message(format!("Install failed: {error}")),
@@ -656,6 +689,14 @@ impl App {
                 Line::from(format!(
                     "Backend service ready: {}",
                     yes_no(status.backend.system_service_ready)
+                )),
+                Line::from(format!(
+                    "Adapter: {}",
+                    status
+                        .backend
+                        .resolved_adapter
+                        .as_deref()
+                        .unwrap_or("not resolved")
                 )),
                 Line::from(format!(
                     "Local output: {}",
@@ -788,7 +829,7 @@ impl App {
         let items = self
             .settings_items()
             .into_iter()
-            .map(|(label, value)| ListItem::new(format!("{label}: {value}")))
+            .map(|(_, label, value)| ListItem::new(format!("{label}: {value}")))
             .collect::<Vec<_>>();
         let mut state = ListState::default();
         if !items.is_empty() {
@@ -809,8 +850,21 @@ impl App {
         let lines = vec![
             Line::from("Use this view for first-run setup and backend repair."),
             Line::from(format!(
-                "Configured adapter: {}",
-                self.config.adapter.as_deref().unwrap_or("auto")
+                "Adapter mode: {}",
+                self.status
+                    .as_ref()
+                    .map(|status| match status.backend.adapter_mode {
+                        AdapterMode::Auto => "auto",
+                        AdapterMode::Explicit => "explicit",
+                    })
+                    .unwrap_or("unknown")
+            )),
+            Line::from(format!(
+                "Resolved adapter: {}",
+                self.status
+                    .as_ref()
+                    .and_then(|status| status.backend.resolved_adapter.as_deref())
+                    .unwrap_or("not resolved")
             )),
             Line::from(format!(
                 "Backend installed: {}",
@@ -869,9 +923,11 @@ impl App {
             InputMode::EditPairingTimeout { value } => {
                 ("Pairing Timeout", value.as_str(), "Enter seconds")
             }
-            InputMode::EditAdapter { value } => {
-                ("Adapter", value.as_str(), "Enter hciX or blank for auto")
-            }
+            InputMode::EditAdapter { value } => (
+                "Adapter",
+                value.as_str(),
+                "Enter hciX for multi-adapter setups",
+            ),
         };
 
         let area = centered_rect(60, 20, frame.area());

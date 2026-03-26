@@ -3,7 +3,8 @@ use std::{env, path::PathBuf};
 use anyhow::{Context, Result, anyhow};
 use orators_core::{OratorsConfig, dbus};
 use orators_linux::{
-    LinuxPlatform, systemd::SystemBackendInstallResult, systemd::SystemdUserRuntime,
+    LinuxPlatform,
+    systemd::{SystemBackendAdapterMode, SystemBackendInstallResult, SystemdUserRuntime},
 };
 use zbus::{Connection, Proxy, fdo::DBusProxy, names::BusName};
 
@@ -224,7 +225,10 @@ pub async fn install_system_backend(
     let user_unit_path = runtime.install_user_service(&daemon_path).await?;
     let install = runtime.install_system_backend(adapter.as_deref()).await?;
 
-    config.adapter = Some(install.adapter.clone());
+    config.adapter = match install.adapter_mode {
+        SystemBackendAdapterMode::Auto => None,
+        SystemBackendAdapterMode::Explicit => Some(install.resolved_adapter.clone()),
+    };
     config.save(&config_path)?;
 
     Ok((user_unit_path, install))

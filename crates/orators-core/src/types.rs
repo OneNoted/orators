@@ -16,6 +16,14 @@ pub enum MediaBackendKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum AdapterMode {
+    #[default]
+    Auto,
+    Explicit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum PlayerState {
     #[default]
     Waiting,
@@ -29,6 +37,9 @@ pub struct MediaBackendStatus {
     pub backend: MediaBackendKind,
     pub installed: bool,
     pub system_service_ready: bool,
+    pub adapter_mode: AdapterMode,
+    pub resolved_adapter: Option<String>,
+    pub configured_adapter: Option<String>,
     pub player_state: PlayerState,
     pub player_running: bool,
     pub active_device_address: Option<String>,
@@ -41,6 +52,9 @@ impl Default for MediaBackendStatus {
             backend: MediaBackendKind::Bluealsa,
             installed: false,
             system_service_ready: false,
+            adapter_mode: AdapterMode::Auto,
+            resolved_adapter: None,
+            configured_adapter: None,
             player_state: PlayerState::Waiting,
             player_running: false,
             active_device_address: None,

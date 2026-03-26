@@ -257,6 +257,7 @@ impl BluealsaRuntime {
             player_running: supervisor.current.is_some(),
             active_device_address: supervisor.current_address.clone(),
             last_error: supervisor.last_error.clone(),
+            ..MediaBackendStatus::default()
         }
     }
 }

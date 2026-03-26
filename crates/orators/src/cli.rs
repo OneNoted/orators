@@ -1,9 +1,10 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use orators_core::{
-    BluetoothProfile, DiagnosticCheck, DiagnosticsReport, OratorsConfig, PlayerState,
+    AdapterMode, BluetoothProfile, DiagnosticCheck, DiagnosticsReport, OratorsConfig, PlayerState,
     RuntimeStatus, Severity, normalize_device_address,
 };
+use orators_linux::systemd::SystemBackendAdapterMode;
 use serde_json::Value;
 
 use crate::control::{
@@ -313,7 +314,11 @@ async fn install_system_backend_command(json: bool, adapter: Option<String>) -> 
             "wireplumber_fragment_path": install.wireplumber_fragment_path,
             "dbus_policy_path": install.dbus_policy_path,
             "system_unit_path": install.system_unit_path,
-            "adapter": install.adapter,
+            "adapter_mode": match install.adapter_mode {
+                SystemBackendAdapterMode::Auto => "auto",
+                SystemBackendAdapterMode::Explicit => "explicit",
+            },
+            "resolved_adapter": install.resolved_adapter,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -330,7 +335,14 @@ async fn install_system_backend_command(json: bool, adapter: Option<String>) -> 
             "Installed BlueALSA system backend at {}.",
             install.system_unit_path.display()
         );
-        println!("Selected Bluetooth adapter: {}.", install.adapter);
+        println!(
+            "Backend adapter mode: {}.",
+            match install.adapter_mode {
+                SystemBackendAdapterMode::Auto => "auto",
+                SystemBackendAdapterMode::Explicit => "explicit",
+            }
+        );
+        println!("Resolved Bluetooth adapter: {}.", install.resolved_adapter);
         println!("Restart WirePlumber and the Orators daemon to activate the backend.");
     }
 
@@ -496,6 +508,19 @@ fn render_audio_summary(status: &RuntimeStatus, diagnostics: Option<&Diagnostics
         }
     );
     println!("Backend installed: {}", yes_no(status.backend.installed),);
+    println!(
+        "Backend adapter mode: {}",
+        match status.backend.adapter_mode {
+            AdapterMode::Auto => "auto",
+            AdapterMode::Explicit => "explicit",
+        }
+    );
+    if let Some(adapter) = status.backend.resolved_adapter.as_deref() {
+        println!("Resolved adapter: {adapter}");
+    }
+    if let Some(adapter) = status.backend.configured_adapter.as_deref() {
+        println!("Configured adapter override: {adapter}");
+    }
     println!(
         "Backend service ready: {}",
         yes_no(status.backend.system_service_ready),

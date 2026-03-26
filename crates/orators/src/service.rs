@@ -3,7 +3,8 @@ use std::{path::Path, path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use orators_core::{
-    AudioDefaults, DeviceInfo, DiagnosticsReport, MediaBackendStatus, OratorsConfig, OratorsState,
+    AdapterMode, AudioDefaults, DeviceInfo, DiagnosticsReport, MediaBackendStatus, OratorsConfig,
+    OratorsState,
 };
 use tokio::sync::Mutex;
 
@@ -362,6 +363,8 @@ impl<R: PlatformRuntime> OratorsService<R> {
         }
         let audio = self.runtime.current_audio_defaults().await?;
         let backend = self.runtime.backend_status().await?;
+        self.clear_stale_adapter_override_if_needed(&backend)
+            .await?;
         let now = now_epoch_secs();
         let mut state = self.state.lock().await;
         state.sync_devices(devices);
@@ -393,6 +396,32 @@ impl<R: PlatformRuntime> OratorsService<R> {
 
         self.runtime.list_devices().await
     }
+
+    async fn clear_stale_adapter_override_if_needed(
+        &self,
+        backend: &MediaBackendStatus,
+    ) -> Result<()> {
+        if backend.adapter_mode != AdapterMode::Auto || backend.resolved_adapter.is_none() {
+            return Ok(());
+        }
+
+        let Some(mut config) = ({
+            let state = self.state.lock().await;
+            if state.config().adapter.is_some() {
+                Some(state.config().clone())
+            } else {
+                None
+            }
+        }) else {
+            return Ok(());
+        };
+
+        config.adapter = None;
+        config.save(&self.config_path)?;
+        self.state.lock().await.update_config(config);
+        Ok(())
+    }
+
     async fn update_config<F>(&self, mutator: F) -> Result<OratorsConfig>
     where
         F: FnOnce(&mut OratorsConfig) -> Result<()>,
