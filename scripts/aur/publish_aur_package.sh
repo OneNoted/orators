@@ -39,7 +39,7 @@ rsync -a --delete --exclude '.git/' "$source_dir/" "$repo_dir/"
   "${repo_root}/scripts/aur/generate_srcinfo.sh" "$PWD/PKGBUILD" > .SRCINFO
   git config user.name "$packager_name"
   git config user.email "$packager_email"
-  git add PKGBUILD .SRCINFO *.install
+  git add -A
   if git diff --cached --quiet; then
     echo "No AUR changes to publish for ${package_name}."
     exit 0
