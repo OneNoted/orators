@@ -63,15 +63,16 @@ trap 'rm -rf "$stage_dir"' EXIT
 mkdir -p "$output_dir"
 cd "$repo_root"
 
-cargo build --locked --release -p orators
+cargo build --locked --release --target "$target" -p orators
+build_dir="target/${target}/release"
 
 mkdir -p \
   "$stage_dir/$archive_root/bin" \
   "$stage_dir/$archive_root/systemd/user"
 
-install -Dm755 target/release/orators "$stage_dir/$archive_root/bin/orators"
-install -Dm755 target/release/oratorsctl "$stage_dir/$archive_root/bin/oratorsctl"
-install -Dm755 target/release/oratorsd "$stage_dir/$archive_root/bin/oratorsd"
+install -Dm755 "$build_dir/orators" "$stage_dir/$archive_root/bin/orators"
+install -Dm755 "$build_dir/oratorsctl" "$stage_dir/$archive_root/bin/oratorsctl"
+install -Dm755 "$build_dir/oratorsd" "$stage_dir/$archive_root/bin/oratorsd"
 install -Dm644 packaging/systemd/user/oratorsd.service \
   "$stage_dir/$archive_root/systemd/user/oratorsd.service"
 install -Dm644 README.md "$stage_dir/$archive_root/README.md"

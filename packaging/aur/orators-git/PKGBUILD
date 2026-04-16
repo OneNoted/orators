@@ -40,7 +40,7 @@ pkgver() {
 
 build() {
   cd "$srcdir/orators"
-  cargo build --frozen --locked --release -p orators
+  cargo build --locked --release -p orators
 }
 
 package() {
