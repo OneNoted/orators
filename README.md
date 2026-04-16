@@ -35,6 +35,23 @@ nix develop
 nix flake check
 ```
 
+## Arch Linux / AUR
+
+- `orators-bin`: prebuilt `x86_64` binaries from GitHub tagged releases
+- `orators-git`: latest GitHub `main`, built locally by makepkg
+- Both AUR variants currently depend on `bluez-alsa-git` for the BlueALSA runtime
+
+Example install:
+
+```bash
+paru -S orators-bin
+systemctl --user daemon-reload
+systemctl --user enable --now oratorsd.service
+oratorsctl install-system-backend
+```
+
+`oratorsctl install-user-service` remains useful for manual tarball installs, but packaged installs should prefer the shipped systemd user unit.
+
 ## Service Model
 
 - `orators` opens the TUI

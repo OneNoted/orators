@@ -302,7 +302,7 @@ async fn ensure_daemon_running(connection: &Connection) -> Result<()> {
     SystemdUserRuntime
         .start_orators_service()
         .await
-        .context("failed to start oratorsd.service; run `oratorsctl install-user-service` first")?;
+        .context("failed to start oratorsd.service; enable the packaged unit with `systemctl --user enable --now oratorsd.service` or run `oratorsctl install-user-service` first")?;
 
     for _ in 0..12 {
         if bus

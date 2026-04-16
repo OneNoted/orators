@@ -1,0 +1,39 @@
+# Maintainer: Jonatan Jonasson <notes@madeingotland.com>
+
+pkgname=orators-bin
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='Turn a Linux desktop into a Bluetooth speaker'
+arch=('x86_64')
+url='https://github.com/OneNoted/orators'
+license=('MIT')
+depends=(
+  'bluez'
+  'bluez-utils'
+  'bluez-alsa-git'
+  'pipewire'
+  'sudo'
+  'systemd'
+  'wireplumber'
+)
+provides=("orators=${pkgver}")
+conflicts=('orators' 'orators-git')
+install='orators.install'
+source=('@SOURCE_URL@')
+sha256sums=('@SHA256@')
+
+_archive_root="orators-v${pkgver}-x86_64-unknown-linux-gnu"
+
+package() {
+  install -Dm755 "${srcdir}/${_archive_root}/bin/orators" "${pkgdir}/usr/bin/orators"
+  install -Dm755 "${srcdir}/${_archive_root}/bin/oratorsctl" "${pkgdir}/usr/bin/oratorsctl"
+  install -Dm755 "${srcdir}/${_archive_root}/bin/oratorsd" "${pkgdir}/usr/bin/oratorsd"
+
+  install -Dm644 "${srcdir}/${_archive_root}/systemd/user/oratorsd.service" \
+    "${pkgdir}/usr/lib/systemd/user/oratorsd.service"
+
+  install -Dm644 "${srcdir}/${_archive_root}/README.md" \
+    "${pkgdir}/usr/share/doc/orators/README.md"
+  install -Dm644 "${srcdir}/${_archive_root}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/orators/LICENSE"
+}
