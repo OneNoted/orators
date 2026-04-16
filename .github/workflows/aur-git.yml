@@ -8,6 +8,7 @@ on:
       - 'packaging/aur/orators-git/**'
       - 'packaging/systemd/user/oratorsd.service'
       - '.github/workflows/aur-git.yml'
+      - 'scripts/aur/generate_srcinfo.sh'
       - 'scripts/aur/publish_aur_package.sh'
   workflow_dispatch:
 
