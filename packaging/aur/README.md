@@ -29,6 +29,7 @@ Set these repository secrets before enabling automatic AUR publishing:
 2. Create and push a tag like `v0.1.0`.
 3. `.github/workflows/release.yml` builds the release archive and publishes it to GitHub Releases.
 4. `.github/workflows/aur-bin.yml` renders the `orators-bin` PKGBUILD with the exact release URL and checksum, then pushes it to AUR.
+5. `scripts/aur/publish_aur_package.sh` bootstraps the initial AUR git push to `master` if the package repo does not exist yet.
 
 ## Updating `orators-git`
 

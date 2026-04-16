@@ -1,0 +1,85 @@
+name: aur-bin
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish without the leading v
+        required: true
+      source_url:
+        description: Release archive URL
+        required: true
+      sha256:
+        description: SHA-256 checksum for the release archive
+        required: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: release
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import urllib.request
+          from pathlib import Path
+
+          event = json.loads(Path('${{ github.event_path }}').read_text())
+          tag_name = event['release']['tag_name']
+          version = tag_name.removeprefix('v')
+          tarball = None
+          checksum = None
+          for asset in event['release']['assets']:
+              name = asset['name']
+              if name == f'orators-{tag_name}-x86_64-unknown-linux-gnu.tar.gz':
+                  tarball = asset['browser_download_url']
+              elif name == f'orators-{tag_name}-x86_64-unknown-linux-gnu.tar.gz.sha256':
+                  checksum = asset['browser_download_url']
+          if tarball is None or checksum is None:
+              raise SystemExit('release assets are missing the expected archive or checksum')
+          with urllib.request.urlopen(checksum) as response:
+              sha256 = response.read().decode().split()[0]
+          print(f'version={version}')
+          print(f'source_url={tarball}')
+          print(f'sha256={sha256}')
+          PY
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "source_url=${{ inputs.source_url }}" >> "$GITHUB_OUTPUT"
+            echo "sha256=${{ inputs.sha256 }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare AUR SSH key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          echo 'GIT_SSH_COMMAND=ssh -i ~/.ssh/aur -o IdentitiesOnly=yes' >> "$GITHUB_ENV"
+
+      - name: Render orators-bin package
+        run: |
+          ./scripts/aur/render_orators_bin_pkgbuild.py \
+            --version "${{ steps.release.outputs.version }}" \
+            --source-url "${{ steps.release.outputs.source_url }}" \
+            --sha256 "${{ steps.release.outputs.sha256 }}" \
+            --output-dir /tmp/orators-bin
+
+      - name: Publish to AUR
+        env:
+          AUR_PACKAGER_NAME: ${{ secrets.AUR_PACKAGER_NAME }}
+          AUR_PACKAGER_EMAIL: ${{ secrets.AUR_PACKAGER_EMAIL }}
+        run: |
+          ./scripts/aur/publish_aur_package.sh \
+            orators-bin \
+            /tmp/orators-bin \
+            "update: orators-bin ${{ steps.release.outputs.version }}"
