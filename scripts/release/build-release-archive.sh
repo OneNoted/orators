@@ -79,7 +79,12 @@ install -Dm644 README.md "$stage_dir/$archive_root/README.md"
 install -Dm644 LICENSE "$stage_dir/$archive_root/LICENSE"
 
 tar -C "$stage_dir" -czf "$archive_path" "$archive_root"
-sha256sum "$archive_path" > "$checksum_path"
+archive_name=$(basename "$archive_path")
+checksum_name=$(basename "$checksum_path")
+(
+  cd "$output_dir"
+  sha256sum "$archive_name" > "$checksum_name"
+)
 cat "$checksum_path" >&2
 
 echo "$archive_path"

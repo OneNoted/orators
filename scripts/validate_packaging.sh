@@ -17,8 +17,14 @@ compile(source, 'scripts/aur/render_orators_bin_pkgbuild.py', 'exec')
 PY
 
 archive_path=$(./scripts/release/build-release-archive.sh --output-dir "$work_dir/dist")
+archive_name=$(basename "$archive_path")
 test -f "$archive_path"
 test -f "${archive_path}.sha256"
+grep -F -- "$archive_name" "${archive_path}.sha256"
+if grep -F -- "$archive_path" "${archive_path}.sha256" >/dev/null; then
+  echo "checksum file should not contain absolute archive paths" >&2
+  exit 1
+fi
 
 ./scripts/aur/render_orators_bin_pkgbuild.py \
   --version 0.1.0 \
@@ -35,7 +41,7 @@ fake_cargo_dir="$work_dir/fake-cargo"
 fake_cargo_log="$work_dir/fake-cargo.log"
 fake_target='aarch64-unknown-linux-gnu'
 mkdir -p "$fake_cargo_dir"
-cat > "$fake_cargo_dir/cargo" <<'EOF'
+cat > "$fake_cargo_dir/cargo" <<'EOF_CARGO'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "$1" == metadata ]]; then
@@ -45,23 +51,32 @@ JSON
   exit 0
 fi
 if [[ "$1" == build ]]; then
-  printf '%s
-' "$*" > "$FAKE_CARGO_LOG"
+  printf '%s\n' "$*" > "$FAKE_CARGO_LOG"
   build_dir="$PWD/target/$FAKE_CARGO_TARGET/release"
   mkdir -p "$build_dir"
   for bin in orators oratorsctl oratorsd; do
-    printf '#!/usr/bin/env bash
-exit 0
-' > "$build_dir/$bin"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$build_dir/$bin"
     chmod +x "$build_dir/$bin"
   done
   exit 0
 fi
 echo "unexpected cargo invocation: $*" >&2
 exit 1
-EOF
+EOF_CARGO
 chmod +x "$fake_cargo_dir/cargo"
-FAKE_CARGO_LOG="$fake_cargo_log" FAKE_CARGO_TARGET="$fake_target" PATH="$fake_cargo_dir:$PATH" ./scripts/release/build-release-archive.sh   --version 0.1.0   --target "$fake_target"   --output-dir "$work_dir/fake-dist" >/dev/null
-rg --fixed-strings -- '--target' "$fake_cargo_log"
-rg --fixed-strings -- "$fake_target" "$fake_cargo_log"
-tar -tzf "$work_dir/fake-dist/orators-v0.1.0-${fake_target}.tar.gz" | rg --fixed-strings "orators-v0.1.0-${fake_target}/bin/orators"
+FAKE_CARGO_LOG="$fake_cargo_log" \
+FAKE_CARGO_TARGET="$fake_target" \
+PATH="$fake_cargo_dir:$PATH" \
+./scripts/release/build-release-archive.sh \
+  --version 0.1.0 \
+  --target "$fake_target" \
+  --output-dir "$work_dir/fake-dist" >/dev/null
+
+grep -F -- '--target' "$fake_cargo_log"
+grep -F -- "$fake_target" "$fake_cargo_log"
+grep -F -- "orators-v0.1.0-${fake_target}.tar.gz" "$work_dir/fake-dist/orators-v0.1.0-${fake_target}.tar.gz.sha256"
+if grep -F -- "$work_dir/fake-dist/orators-v0.1.0-${fake_target}.tar.gz" "$work_dir/fake-dist/orators-v0.1.0-${fake_target}.tar.gz.sha256" >/dev/null; then
+  echo "fake-target checksum file should not contain absolute archive paths" >&2
+  exit 1
+fi
+tar -tzf "$work_dir/fake-dist/orators-v0.1.0-${fake_target}.tar.gz" | grep -F -- "orators-v0.1.0-${fake_target}/bin/orators"
