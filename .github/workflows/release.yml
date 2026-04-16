@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches workspace version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          workspace_version=$(python - <<'PY'
+          import json, subprocess
+          metadata = json.loads(subprocess.check_output([
+              'cargo', 'metadata', '--no-deps', '--format-version', '1'
+          ], text=True))
+          for package in metadata['packages']:
+              if package['name'] == 'orators':
+                  print(package['version'])
+                  break
+          else:
+              raise SystemExit('could not resolve orators package version')
+          PY
+          )
+          if [[ "$tag_version" != "$workspace_version" ]]; then
+            echo "Tag version $tag_version does not match workspace version $workspace_version" >&2
+            exit 1
+          fi
+
+      - name: Build release archive
+        id: bundle
+        run: |
+          archive_path=$(./scripts/release/build-release-archive.sh --version "${GITHUB_REF_NAME#v}")
+          echo "archive_path=$archive_path" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=${archive_path}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "${{ steps.bundle.outputs.archive_path }}" \
+            "${{ steps.bundle.outputs.checksum_path }}" \
+            --title "orators ${GITHUB_REF_NAME#v}" \
+            --notes "Automated release for orators ${GITHUB_REF_NAME#v}."

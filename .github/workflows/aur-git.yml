@@ -1,0 +1,43 @@
+name: aur-git
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'packaging/aur/orators-git/**'
+      - 'packaging/systemd/user/oratorsd.service'
+      - '.github/workflows/aur-git.yml'
+      - 'scripts/aur/generate_srcinfo.sh'
+      - 'scripts/aur/publish_aur_package.sh'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare AUR SSH key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          echo 'GIT_SSH_COMMAND=ssh -i ~/.ssh/aur -o IdentitiesOnly=yes' >> "$GITHUB_ENV"
+
+      - name: Stage orators-git package
+        run: |
+          rsync -a --delete packaging/aur/orators-git/ /tmp/orators-git/
+
+      - name: Publish to AUR
+        env:
+          AUR_PACKAGER_NAME: ${{ secrets.AUR_PACKAGER_NAME }}
+          AUR_PACKAGER_EMAIL: ${{ secrets.AUR_PACKAGER_EMAIL }}
+        run: |
+          ./scripts/aur/publish_aur_package.sh \
+            orators-git \
+            /tmp/orators-git \
+            "update: refresh orators-git packaging"

@@ -23,4 +23,6 @@ jobs:
         run: cargo test --workspace
       - name: Nix flake check
         run: nix flake check
+      - name: Validate release and AUR packaging
+        run: ./scripts/validate_packaging.sh
 

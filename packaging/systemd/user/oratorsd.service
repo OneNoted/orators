@@ -1,0 +1,12 @@
+[Unit]
+Description=Orators Bluetooth speaker daemon
+After=default.target bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/oratorsd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
